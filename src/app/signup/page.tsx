@@ -11,7 +11,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { User, HeartHand } from "lucide-react";
+import { User, HeartHandshake } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 type Role = "user" | "contact";
@@ -70,7 +70,7 @@ export default function SignupPage() {
                   </Label>
                   <Label htmlFor="role-contact" className={`flex items-center gap-4 border p-6 rounded-lg cursor-pointer transition-all ${role === 'contact' ? 'bg-secondary border-primary shadow-md' : 'hover:bg-secondary/50'}`}>
                     <RadioGroupItem value="contact" id="role-contact" className="h-6 w-6" />
-                    <HeartHand className="h-10 w-10 text-accent" />
+                    <HeartHandshake className="h-10 w-10 text-accent" />
                     <div>
                       <h3 className="font-bold text-lg">Emergency Contact / Caregiver</h3>
                       <p className="text-muted-foreground">I will be monitoring and assisting a User.</p>
