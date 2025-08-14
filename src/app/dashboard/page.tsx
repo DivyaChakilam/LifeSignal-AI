@@ -1,12 +1,15 @@
+
 "use client";
 
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Siren, CheckCircle2, Timer } from "lucide-react";
+import { Siren, CheckCircle2, Timer, Clock } from "lucide-react";
 import { VoiceCheckIn } from "@/components/voice-check-in";
 import { useToast } from "@/hooks/use-toast";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+
 
 export default function DashboardPage() {
     const { toast } = useToast();
@@ -23,6 +26,13 @@ export default function DashboardPage() {
             title: "SOS Alert Sent!",
             description: "Your emergency contacts have been notified.",
             variant: "destructive",
+        });
+    }
+
+    const handleIntervalChange = (value: string) => {
+        toast({
+            title: "Check-in Interval Updated",
+            description: `Your check-in interval has been set to every ${value} hours.`,
         });
     }
 
@@ -60,8 +70,32 @@ export default function DashboardPage() {
                     </Button>
                 </CardContent>
             </Card>
+            
+            <Card className="shadow-lg">
+                <CardHeader className="flex flex-row items-center justify-between">
+                    <div>
+                        <CardTitle className="text-2xl font-headline">Set Interval</CardTitle>
+                        <CardDescription>Choose your check-in frequency.</CardDescription>
+                    </div>
+                     <Clock className="h-8 w-8 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                   <Select onValueChange={handleIntervalChange} defaultValue="12">
+                       <SelectTrigger className="w-full text-lg">
+                           <SelectValue placeholder="Select interval" />
+                       </SelectTrigger>
+                       <SelectContent>
+                           <SelectItem value="6">Every 6 hours</SelectItem>
+                           <SelectItem value="10">Every 10 hours</SelectItem>
+                           <SelectItem value="12">Every 12 hours</SelectItem>
+                           <SelectItem value="18">Every 18 hours</SelectItem>
+                           <SelectItem value="24">Every 24 hours</SelectItem>
+                       </SelectContent>
+                   </Select>
+                </CardContent>
+            </Card>
 
-            <Card className="md:col-span-2 shadow-lg">
+            <Card className="shadow-lg">
                 <CardHeader className="flex flex-row items-center justify-between">
                     <div>
                         <CardTitle className="text-2xl font-headline">Status</CardTitle>
