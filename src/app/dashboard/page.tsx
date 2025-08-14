@@ -9,6 +9,7 @@ import { Siren, CheckCircle2, Timer, Clock } from "lucide-react";
 import { VoiceCheckIn } from "@/components/voice-check-in";
 import { useToast } from "@/hooks/use-toast";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { EmergencyContacts } from "@/components/emergency-contacts";
 
 
 export default function DashboardPage() {
@@ -110,7 +111,11 @@ export default function DashboardPage() {
                 </CardContent>
             </Card>
 
+            <div className="md:col-span-2">
+                <EmergencyContacts />
+            </div>
           </div>
+
           <div className="lg:col-span-1">
             <VoiceCheckIn />
           </div>

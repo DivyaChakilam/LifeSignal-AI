@@ -148,7 +148,7 @@ export default function SignupPage() {
                     <CardDescription>Let's get your basic information.</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                     <Button className="w-full text-lg py-6 flex items-center gap-3">
+                     <Button type="button" className="w-full text-lg py-6 flex items-center gap-3">
                         <svg className="w-6 h-6" viewBox="0 0 24 24">
                             <path fill="currentColor" d="M21.35,11.1H12.18V13.83H18.69C18.36,17.64 15.19,19.27 12.19,19.27C8.36,19.27 5,16.25 5,12C5,7.75 8.36,4.73 12.19,4.73C14.03,4.73 15.6,5.33 16.84,6.46L19.09,4.21C17.2,2.34 14.86,1.5 12.19,1.5C6.92,1.5 2.5,6.08 2.5,12C2.5,17.92 6.92,22.5 12.19,22.5C17.6,22.5 21.5,18.33 21.5,12.33C21.5,11.76 21.44,11.43 21.35,11.1V11.1Z" />
                         </svg>
