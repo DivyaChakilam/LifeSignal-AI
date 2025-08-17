@@ -13,6 +13,10 @@ import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { useToast } from "@/hooks/use-toast";
 
+import { auth } from "@/firebase"; // <-- your firebase.ts
+import { signInWithEmailAndPassword } from "firebase/auth";
+import { useState } from "react";
+
 const loginSchema = z.object({
   email: z.string().email({ message: "Please enter a valid email address." }),
   password: z.string().min(1, { message: "Password is required." }),
@@ -21,24 +25,30 @@ const loginSchema = z.object({
 export default function LoginPage() {
   const router = useRouter();
   const { toast } = useToast();
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const form = useForm<z.infer<typeof loginSchema>>({
     resolver: zodResolver(loginSchema),
-    defaultValues: {
-      email: "",
-      password: "",
-    },
+    defaultValues: { email: "", password: "" },
   });
 
-  const onSubmit = (values: z.infer<typeof loginSchema>) => {
-    // In a real app, you would authenticate the user here.
-    // For this prototype, we'll simulate a successful login.
-    toast({
-      title: "Login Successful",
-      description: "Welcome back! Redirecting you to the dashboard.",
-    });
-    // This could redirect to /dashboard or /emergency-dashboard based on user role
-    router.push("/dashboard");
+  const onSubmit = async (values: z.infer<typeof loginSchema>) => {
+    try {
+      setIsSubmitting(true);
+      const { user } = await signInWithEmailAndPassword(auth, values.email, values.password);
+      toast({ title: "Login Successful", description: `Welcome back, ${user.email ?? "user"}!` });
+      router.push("/dashboard");
+    } catch (err: any) {
+      // Friendly error messages
+      const code = err?.code as string | undefined;
+      let message = "Something went wrong. Please try again.";
+      if (code === "auth/invalid-email") message = "Invalid email address.";
+      else if (code === "auth/user-not-found" || code === "auth/wrong-password") message = "Incorrect email or password.";
+      else if (code === "auth/too-many-requests") message = "Too many attempts. Please wait and try again.";
+      toast({ title: "Login failed", description: message, variant: "destructive" });
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -50,6 +60,7 @@ export default function LoginPage() {
             <CardTitle className="text-3xl font-headline">Welcome Back!</CardTitle>
             <CardDescription>Sign in to continue to LifeSignal AI</CardDescription>
           </CardHeader>
+
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)}>
               <CardContent className="space-y-4">
@@ -60,7 +71,7 @@ export default function LoginPage() {
                     <FormItem>
                       <FormLabel>Email</FormLabel>
                       <FormControl>
-                        <Input type="email" placeholder="your@email.com" {...field} />
+                        <Input type="email" placeholder="your@email.com" {...field} disabled={isSubmitting} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -73,7 +84,7 @@ export default function LoginPage() {
                     <FormItem>
                       <FormLabel>Password</FormLabel>
                       <FormControl>
-                        <Input type="password" placeholder="••••••••" {...field} />
+                        <Input type="password" placeholder="••••••••" {...field} disabled={isSubmitting} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -81,14 +92,14 @@ export default function LoginPage() {
                 />
               </CardContent>
               <CardFooter className="flex flex-col gap-4">
-                <Button type="submit" className="w-full text-lg py-6">
-                  Sign In
+                <Button type="submit" className="w-full text-lg py-6" disabled={isSubmitting}>
+                  {isSubmitting ? "Signing in..." : "Sign In"}
                 </Button>
-                 <p className="text-center text-sm text-muted-foreground">
-                    New to LifeSignal?{" "}
-                    <Link href="/signup" className="font-semibold text-primary hover:underline">
-                        Create an account
-                    </Link>
+                <p className="text-center text-sm text-muted-foreground">
+                  New to LifeSignal?{" "}
+                  <Link href="/signup" className="font-semibold text-primary hover:underline">
+                    Create an account
+                  </Link>
                 </p>
               </CardFooter>
             </form>
