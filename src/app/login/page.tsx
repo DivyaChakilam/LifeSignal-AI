@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation"; // ✅ correct for App Router
+import { useRouter } from "next/navigation"; 
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -27,9 +27,12 @@ import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { useToast } from "@/hooks/use-toast";
 
-import { auth } from "@/firebase"; // <-- your firebase.ts
+import { auth } from "@/firebase"; 
 import { signInWithEmailAndPassword } from "firebase/auth";
 import { useState } from "react";
+
+// ✅ Import FCM helper
+import { saveFcmToken } from "@/lib/useFcmToken";
 
 const loginSchema = z.object({
   email: z.string().email({ message: "Please enter a valid email address." }),
@@ -37,7 +40,7 @@ const loginSchema = z.object({
 });
 
 export default function LoginPage() {
-  const router = useRouter(); // ✅ app router navigation
+  const router = useRouter(); 
   const { toast } = useToast();
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -54,11 +57,15 @@ export default function LoginPage() {
         values.email,
         values.password
       );
+
+      // ✅ Save FCM token to Firestore
+      await saveFcmToken(user);
+
       toast({
         title: "Login Successful",
         description: `Welcome back, ${user.email ?? "user"}!`,
       });
-      router.push("/dashboard"); // ✅ works now
+      router.push("/dashboard");
     } catch (err: any) {
       const code = err?.code as string | undefined;
       let message = "Something went wrong. Please try again.";
