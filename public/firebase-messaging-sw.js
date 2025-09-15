@@ -1,32 +1,74 @@
 /* public/firebase-messaging-sw.js */
+/* v1 */
 
-// Import scripts for Firebase
-importScripts("https://www.gstatic.com/firebasejs/9.6.10/firebase-app-compat.js");
-importScripts("https://www.gstatic.com/firebasejs/9.6.10/firebase-messaging-compat.js");
+importScripts('https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js');
+importScripts('https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js');
 
-// Your Firebase config (use the same values as in src/firebase.ts)
+// Use real values (same as your client app)
 firebase.initializeApp({
-  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
-  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
-  measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
+  apiKey: "AIzaSyCOrPxHcBmvlUq-18AjjZjpWoMbKP2_las",
+  authDomain: "lifesignal-ai.firebaseapp.com",
+  projectId: "lifesignal-ai",
+  storageBucket: "lifesignal-ai.firebasestorage.app",
+  messagingSenderId: "190944485180",
+  appId: "1:190944485180:web:dd0f41eef605d648e34839",
 });
 
-// Retrieve an instance of Firebase Messaging
+// Take over immediately so the page is controlled after next load
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+
 const messaging = firebase.messaging();
 
-// Handle background messages
-messaging.onBackgroundMessage((payload) => {
-  console.log("[firebase-messaging-sw.js] Received background message ", payload);
+/**
+ * FCM background handler (mostly for data-only messages).
+ * If your payload includes a top-level `notification`, most browsers
+ * will auto-display and this may not run—that’s normal.
+ */
+messaging.onBackgroundMessage((payload = {}) => {
+  const n = payload.notification || {};
+  const d = payload.data || {};
 
-  const notificationTitle = payload.notification?.title || "New Notification";
-  const notificationOptions = {
-    body: payload.notification?.body,
-    // No icon for now, can add later
+  const title = n.title || d.title || 'New Notification';
+  const options = {
+    body: n.body || d.body || '',
+    icon: '/icon-192x192.png',     // make sure this file exists in /public
+    data: { url: d.url || '/', ...d },
   };
 
-  self.registration.showNotification(notificationTitle, notificationOptions);
+  self.registration.showNotification(title, options);
+});
+
+/**
+ * Fallback for generic Web Push or unusual payloads.
+ * Ensures a notification still shows even if the compat handler doesn't fire.
+ */
+self.addEventListener('push', (event) => {
+  let p = {};
+  try { p = event.data?.json?.() || {}; } catch {}
+  // Browser will auto-display top-level notification payloads.
+  if (p.notification) return;
+
+  const d = p.data || {};
+  const title = d.title || 'Notification';
+  const options = { body: d.body || '', icon: '/icon-192x192.png', data: { url: d.url || '/' } };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+// Focus an existing tab with the same path, or open a new one
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const urlToOpen = event.notification.data?.url || '/';
+
+  event.waitUntil((async () => {
+    const all = await clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const targetPath = new URL(urlToOpen, self.location.origin).pathname;
+
+    for (const c of all) {
+      try {
+        if (new URL(c.url).pathname === targetPath) return c.focus();
+      } catch {}
+    }
+    return clients.openWindow(urlToOpen);
+  })());
 });

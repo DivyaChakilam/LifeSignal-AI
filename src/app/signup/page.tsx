@@ -1,8 +1,9 @@
+// app/signup/page.tsx
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -10,15 +11,35 @@ import * as z from "zod";
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  CardFooter,
+} from "@/components/ui/card";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/hooks/use-toast";
 
 import { auth, db } from "@/firebase";
-import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
+import {
+  createUserWithEmailAndPassword,
+  updateProfile,
+  sendEmailVerification,
+} from "firebase/auth";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+
+import { normalizeRole, Role } from "@/lib/roles";
 
 const passwordValidation = z
   .string()
@@ -42,7 +63,37 @@ const signupSchema = z
 
 export default function SignupPage() {
   const router = useRouter();
+  const params = useSearchParams();
   const { toast } = useToast();
+
+  // Role + optional invite token
+  const role: Role = normalizeRole(params.get("role")) ?? "main_user";
+  const token = params.get("token") || null;
+
+  // Sanitize "next": allow same-site paths only; treat "/" as unset
+  const rawNext = params.get("next");
+  const next = useMemo(() => {
+    const n = rawNext && rawNext.startsWith("/") ? rawNext : "";
+    return n === "/" ? "" : n;
+  }, [rawNext]);
+
+  // Base origin for action code settings
+  const appOrigin =
+    typeof window === "undefined"
+      ? process.env.NEXT_PUBLIC_APP_ORIGIN || ""
+      : window.location.origin;
+
+  // Continue URL for email verification; include role/fromHosted and only meaningful params
+  const continueUrl = useMemo(() => {
+    const q = new URLSearchParams({
+      role,
+      fromHosted: "1",
+      ...(next ? { next } : {}),
+      ...(token ? { token } : {}),
+    }).toString();
+    return `${appOrigin}/verify-email?${q}`;
+  }, [appOrigin, role, next, token]);
+
   const [passwordStrength, setPasswordStrength] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -69,22 +120,46 @@ export default function SignupPage() {
       setIsSubmitting(true);
 
       // 1) Create auth user
-      const cred = await createUserWithEmailAndPassword(auth, values.email, values.password);
+      const cred = await createUserWithEmailAndPassword(
+        auth,
+        values.email.trim().toLowerCase(),
+        values.password
+      );
 
-      // 2) Set display name in Firebase Auth (optional)
+      // 2) Set display name
       await updateProfile(cred.user, { displayName: values.name });
 
-      // 3) Create a user profile document in Firestore (optional but common)
-      await setDoc(doc(db, "users", cred.user.uid), {
-        uid: cred.user.uid,
-        name: values.name,
-        email: values.email,
-        createdAt: serverTimestamp(),
-      });
+      // 3) Create/merge Firestore profile with canonical role
+      await setDoc(
+        doc(db, "users", cred.user.uid),
+        {
+          uid: cred.user.uid,
+          name: values.name,
+          email: (cred.user.email || "").toLowerCase(),
+          role, // 'main_user' | 'emergency_contact'
+          createdAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-      toast({ title: "Account Created!", description: "Welcome to LifeSignal AI." });
-      router.push("/dashboard"); // or /login if you want them to sign in again
+      // 4) Send verification email (hosted flow returns to /verify-email)
+      try {
+        await sendEmailVerification(cred.user, {
+          url: continueUrl,
+          handleCodeInApp: true,
+        });
+      } catch (e) {
+        console.warn("sendEmailVerification failed:", e);
+      }
+
+      // 5) Route to verify-email; include next/token only when present
+      router.push(
+        `/verify-email?email=${encodeURIComponent(values.email)}&role=${encodeURIComponent(role)}${
+          next ? `&next=${encodeURIComponent(next)}` : ""
+        }${token ? `&token=${encodeURIComponent(token)}` : ""}`
+      );
     } catch (err: any) {
+      console.error(err);
       const code = err?.code as string | undefined;
       let message = "Something went wrong. Please try again.";
       if (code === "auth/email-already-in-use") message = "That email is already registered.";
@@ -103,8 +178,13 @@ export default function SignupPage() {
         <Card className="w-full max-w-lg shadow-xl">
           <CardHeader className="text-center">
             <CardTitle className="text-3xl font-headline">Create Your Account</CardTitle>
-            <CardDescription>Join LifeSignal AI to stay safe and connected.</CardDescription>
+            <CardDescription>
+              {role === "emergency_contact"
+                ? "You’re signing up as an emergency contact."
+                : "Create your main user account."}
+            </CardDescription>
           </CardHeader>
+
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)}>
               <CardContent className="space-y-4">
@@ -121,6 +201,7 @@ export default function SignupPage() {
                     </FormItem>
                   )}
                 />
+
                 <FormField
                   control={form.control}
                   name="email"
@@ -134,6 +215,7 @@ export default function SignupPage() {
                     </FormItem>
                   )}
                 />
+
                 <FormField
                   control={form.control}
                   name="password"
@@ -148,6 +230,7 @@ export default function SignupPage() {
                     </FormItem>
                   )}
                 />
+
                 <FormField
                   control={form.control}
                   name="confirmPassword"
@@ -162,13 +245,20 @@ export default function SignupPage() {
                   )}
                 />
               </CardContent>
+
               <CardFooter className="flex-col gap-4">
                 <Button type="submit" className="w-full text-lg py-6" disabled={isSubmitting}>
                   {isSubmitting ? "Creating…" : "Create Account"}
                 </Button>
+
                 <p className="text-center text-sm text-muted-foreground">
                   Already have an account?{" "}
-                  <Link href="/login" className="font-semibold text-primary hover:underline">
+                  <Link
+                    href={`/login?role=${encodeURIComponent(role)}${
+                      next ? `&next=${encodeURIComponent(next)}` : ""
+                    }${token ? `&token=${encodeURIComponent(token)}` : ""}`}
+                    className="font-semibold text-primary hover:underline"
+                  >
                     Sign In
                   </Link>
                 </p>

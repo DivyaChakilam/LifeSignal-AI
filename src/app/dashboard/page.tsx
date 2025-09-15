@@ -1,3 +1,4 @@
+// app/dashboard/page.tsx
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -10,12 +11,13 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { onAuthStateChanged } from "firebase/auth";
+import { useRouter } from "next/navigation";
 import { auth, db } from "@/firebase";
 
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 import { VoiceCheckIn } from "@/components/voice-check-in";
-import { EmergencyContacts } from "@/components/emergency-contacts";
+import { EmergencyContacts } from "@/components/emergency-contact";
 
 // shadcn/ui
 import { Button } from "@/components/ui/button";
@@ -38,17 +40,26 @@ import { useToast } from "@/hooks/use-toast";
 // icons
 import { Siren, CheckCircle2, Timer, Clock } from "lucide-react";
 
-// Firestore user document shape (extend as needed)
+// roles
+import { normalizeRole } from "@/lib/roles";
+
+// ✅ device registration (primary role for this dashboard)
+import { registerDevice } from "@/lib/useFcmToken";
+
 interface UserDoc {
   lastCheckinAt?: Timestamp;
-  checkinInterval?: number | string; // minutes
+  settings?: {
+    checkinInterval?: number | string; // minutes
+  };
   locationSharing?: boolean;
   sosTriggeredAt?: Timestamp;
+  role?: string;
 }
 
 type Status = "safe" | "missed" | "unknown";
 
 export default function DashboardPage() {
+  const router = useRouter();
   const { toast } = useToast();
 
   const [lastCheckIn, setLastCheckIn] = useState<Date | null>(null);
@@ -56,9 +67,49 @@ export default function DashboardPage() {
   const [status, setStatus] = useState<Status>("unknown");
   const [timeLeft, setTimeLeft] = useState<string>("");
   const [locationSharing, setLocationSharing] = useState<boolean | null>(null);
+  const [roleChecked, setRoleChecked] = useState(false);
+  const [uid, setUid] = useState<string | null>(null);
 
   const userDocUnsubRef = useRef<(() => void) | null>(null);
   const userRef = useRef<ReturnType<typeof doc> | null>(null);
+
+// Show OS banner even when the tab is focused
+useEffect(() => {
+  let unsub: (() => void) | undefined;
+
+  (async () => {
+    const { isSupported, getMessaging, onMessage } = await import('firebase/messaging');
+    if (!(await isSupported())) return;
+
+    // reuse your initialized app via dynamic import of your firebase module
+    const { initializeApp, getApps } = await import('firebase/app');
+    const apps = getApps();
+    const app = apps.length
+      ? apps[0]
+      : initializeApp({
+          apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
+          authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+          projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+          messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+          appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
+        });
+
+    const messaging = getMessaging(app);
+
+    unsub = onMessage(messaging, async (payload) => {
+      const reg = await navigator.serviceWorker.ready;
+      const title = payload.notification?.title || payload.data?.title || 'Notification';
+      const body  = payload.notification?.body  || payload.data?.body  || '';
+      const url   = payload.fcmOptions?.link    || payload.data?.url    || '/';
+      reg.showNotification(title, { body, data: { url } });
+    });
+  })();
+
+  return () => unsub?.();
+}, []);
+
+
+
 
   // Auth + Firestore subscription
   useEffect(() => {
@@ -71,23 +122,38 @@ export default function DashboardPage() {
 
       if (!user) {
         userRef.current = null;
+        setUid(null);
         setLastCheckIn(null);
         setIntervalMinutes(12 * 60);
         setStatus("unknown");
         setTimeLeft("");
         setLocationSharing(null);
+        setRoleChecked(true);
         return;
       }
 
+      setUid(user.uid);
       const uref = doc(db, "users", user.uid);
       userRef.current = uref;
 
-      // Ensure the doc exists so updateDoc won't fail later
+      // Ensure doc exists so later updates don't fail
       await setDoc(uref, { createdAt: serverTimestamp() }, { merge: true });
 
       const unsub = onSnapshot(uref, (snap) => {
-        if (!snap.exists()) return;
+        if (!snap.exists()) {
+          setRoleChecked(true);
+          return;
+        }
         const data = snap.data() as UserDoc;
+
+        // Gate by role: emergency contacts aren't allowed here
+        const r = normalizeRole(data.role);
+        if (r === "emergency_contact") {
+          router.replace("/emergency-dashboard");
+          return;
+        }
+
+        setRoleChecked(true);
 
         if (data.lastCheckinAt instanceof Timestamp) {
           setLastCheckIn(data.lastCheckinAt.toDate());
@@ -95,7 +161,7 @@ export default function DashboardPage() {
           setLastCheckIn(null);
         }
 
-        const rawInt = data.checkinInterval;
+        const rawInt = data.settings?.checkinInterval;
         const parsed =
           typeof rawInt === "string"
             ? parseInt(rawInt, 10)
@@ -121,7 +187,15 @@ export default function DashboardPage() {
         userDocUnsubRef.current = null;
       }
     };
-  }, []);
+  }, [router]);
+
+  // ✅ Register this device for push in the main dashboard (role: "primary")
+  useEffect(() => {
+    if (!roleChecked || !uid) return;
+    // Only run registration when we're definitively on the primary dashboard
+    // (If you also use role in UI state, you could gate it further.)
+    registerDevice(uid, "primary"); // stores token under users/{uid}/devices/{deviceId} with role: "primary"
+  }, [roleChecked, uid]);
 
   // Derived next check-in time
   const nextCheckIn = useMemo(() => {
@@ -129,7 +203,7 @@ export default function DashboardPage() {
     return new Date(lastCheckIn.getTime() + intervalMinutes * 60 * 1000);
   }, [lastCheckIn, intervalMinutes]);
 
-  // Countdown + status (clamped, zero-padded)
+  // Countdown + status
   useEffect(() => {
     if (!nextCheckIn) {
       setStatus("unknown");
@@ -189,21 +263,25 @@ export default function DashboardPage() {
   const handleCheckIn = async () => {
     try {
       if (!userRef.current) throw new Error("Not signed in");
-      // Optimistic UI
+      // optimistic UI
       setLastCheckIn(new Date());
       await updateDoc(userRef.current, {
         lastCheckinAt: serverTimestamp(),
       });
       toast({ title: "Checked In!", description: "Your status has been updated to 'OK'." });
     } catch (e: any) {
-      toast({ title: "Check-in failed", description: e?.message ?? "Please try again.", variant: "destructive" });
+      toast({
+        title: "Check-in failed",
+        description: e?.message ?? "Please try again.",
+        variant: "destructive",
+      });
     }
   };
 
   const handleSOS = async () => {
     try {
       if (!userRef.current) throw new Error("Not signed in");
-      await updateDoc(userRef.current, {
+    await updateDoc(userRef.current, {
         sosTriggeredAt: serverTimestamp(),
       });
       toast({
@@ -212,14 +290,18 @@ export default function DashboardPage() {
         variant: "destructive",
       });
     } catch (e: any) {
-      toast({ title: "Unable to send SOS", description: e?.message ?? "Please try again.", variant: "destructive" });
+      toast({
+        title: "Unable to send SOS",
+        description: e?.message ?? "Please try again.",
+        variant: "destructive",
+      });
     }
   };
 
   const HOURS_OPTIONS = [1, 2, 3, 6, 10, 12, 18, 24] as const;
   const selectedHours = useMemo(() => {
     const h = Math.round(intervalMinutes / 60);
-    return HOURS_OPTIONS.includes(h as any) ? String(h) : "12"; // default display
+    return HOURS_OPTIONS.includes(h as any) ? String(h) : "12";
   }, [intervalMinutes]);
 
   const handleIntervalChange = async (value: string) => {
@@ -228,15 +310,44 @@ export default function DashboardPage() {
     try {
       setIntervalMinutes(minutes);
       if (!userRef.current) throw new Error("Not signed in");
-      await updateDoc(userRef.current, { checkinInterval: minutes });
+      await setDoc(
+        userRef.current,
+        { settings: { checkinInterval: minutes } },
+        { merge: true }
+      );
       toast({
         title: "Check-in Interval Updated",
         description: `Your check-in interval has been set to every ${hours} hours.`,
       });
     } catch (e: any) {
-      toast({ title: "Update failed", description: e?.message ?? "Please try again.", variant: "destructive" });
+      toast({
+        title: "Update failed",
+        description: e?.message ?? "Please try again.",
+        variant: "destructive",
+      });
     }
   };
+
+  // Don't flash dashboard before we confirm role
+  if (!roleChecked) {
+    return (
+      <div className="flex flex-col min-h-screen bg-secondary">
+        <Header />
+        <main className="flex-grow container mx-auto px-4 py-8">
+          <Card className="shadow-lg">
+            <CardHeader>
+              <CardTitle className="text-2xl font-headline">Loading…</CardTitle>
+              <CardDescription>Preparing your dashboard.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="h-24 animate-pulse bg-muted rounded" />
+            </CardContent>
+          </Card>
+        </main>
+        <Footer />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col min-h-screen bg-secondary">
@@ -268,7 +379,7 @@ export default function DashboardPage() {
             <Card className="text-center shadow-lg hover:shadow-xl transition-shadow">
               <CardHeader>
                 <CardTitle className="text-3xl font-headline">Manual Check-in</CardTitle>
-                <CardDescription>Let your contacts know you're safe.</CardDescription>
+                <CardDescription>Let your emergency contacts know you're safe.</CardDescription>
               </CardHeader>
               <CardContent>
                 <Button
@@ -318,17 +429,25 @@ export default function DashboardPage() {
               </CardHeader>
               <CardContent className="space-y-2">
                 <p className="text-lg">
-                  Last Check-in: <span className="font-bold text-primary">{formatWhen(lastCheckIn)}</span>
+                  Last Check-in:{" "}
+                  <span className="font-bold text-primary">{formatWhen(lastCheckIn)}</span>
                 </p>
                 <p className="text-lg">
-                  Next scheduled check-in: {" "}
+                  Next scheduled check-in:{" "}
                   <span className="font-bold text-primary">{formatWhen(nextCheckIn)}</span>
                 </p>
                 <p className="text-lg">
-                  Countdown: <span className={status === "missed" ? "font-bold text-destructive" : "font-bold text-primary"}>{timeLeft || "—"}</span>
+                  Countdown:{" "}
+                  <span
+                    className={
+                      status === "missed" ? "font-bold text-destructive" : "font-bold text-primary"
+                    }
+                  >
+                    {timeLeft || "—"}
+                  </span>
                 </p>
                 <p className="text-lg">
-                  Status: {" "}
+                  Status:{" "}
                   <span
                     className={
                       status === "safe"
@@ -342,14 +461,16 @@ export default function DashboardPage() {
                   </span>
                 </p>
                 <p className="text-lg">
-                  Location Sharing: {" "}
-                  <span className={
-                    locationSharing === true
-                      ? "font-bold text-green-600"
-                      : locationSharing === false
-                      ? "font-bold text-destructive"
-                      : "font-bold text-muted-foreground"
-                  }>
+                  Location Sharing:{" "}
+                  <span
+                    className={
+                      locationSharing === true
+                        ? "font-bold text-green-600"
+                        : locationSharing === false
+                        ? "font-bold text-destructive"
+                        : "font-bold text-muted-foreground"
+                    }
+                  >
                     {locationSharing === null ? "—" : locationSharing ? "Enabled" : "Disabled"}
                   </span>
                 </p>

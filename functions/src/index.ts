@@ -1,73 +1,125 @@
+// functions/src/index.ts
 import * as admin from "firebase-admin";
-import {setGlobalOptions} from "firebase-functions/v2";
-import {onSchedule} from "firebase-functions/v2/scheduler";
+import { setGlobalOptions } from "firebase-functions/v2";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as logger from "firebase-functions/logger";
+import { Timestamp } from "firebase-admin/firestore";
 
-setGlobalOptions({maxInstances: 10});
+setGlobalOptions({ maxInstances: 10 });
+if (!admin.apps.length) admin.initializeApp();
 
-// Initialize Firebase Admin SDK
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
 const db = admin.firestore();
 const messaging = admin.messaging();
 
+/** Convert ms epoch to whole minutes since epoch (drops seconds). */
+function toEpochMinutes(ms: number): number {
+  return Math.floor(ms / 60000);
+}
+
 /**
- * Scheduled function to check missed check-ins and send push notifications.
- * Runs every 15 minutes.
+ * Read interval in MINUTES and return a valid number.
+ * Defaults to 720 (12h) when unset/invalid.
+ */
+function getIntervalMinutes(data: unknown): number {
+  const d = data as Record<string, unknown>;
+  const settings =
+    (d?.settings as Record<string, unknown> | undefined) ?? {};
+  let minutes = Number(settings.checkinInterval ?? d?.checkinInterval ?? 720);
+  if (!Number.isFinite(minutes) || minutes <= 0) minutes = 720;
+  return minutes;
+}
+
+/**
+ * Every 15 minutes:
+ * If now >= lastCheckinAt + interval (in minutes), send push once,
+ * and record missedNotifiedAt to avoid repeats.
  */
 export const checkMissedCheckins = onSchedule(
   "every 15 minutes",
   async () => {
-    try {
-      const now = Date.now();
+    const nowMin = toEpochMinutes(Date.now());
+    const usersSnap = await db.collection("users").get();
 
-      // Fetch all users
-      const usersSnapshot = await db.collection("users").get();
+    for (const userDoc of usersSnap.docs) {
+      const data = userDoc.data();
+      const uid = userDoc.id;
 
-      for (const userDoc of usersSnapshot.docs) {
-        const userData = userDoc.data();
-        const userId = userDoc.id;
+      const lastTs = data.lastCheckinAt as Timestamp | undefined;
+      if (!lastTs) continue;
 
-        const lastCheckin = userData.lastCheckin as number | undefined;
-        const interval =
-          userData.checkinInterval || 2 * 60 * 60 * 1000; // default 2 hrs
-        const fcmToken = userData.fcmToken as string | undefined;
+      const lastMin = toEpochMinutes(lastTs.toMillis());
+      const intervalMin = getIntervalMinutes(data);
+      const dueAtMin = lastMin + intervalMin;
 
-        if (!lastCheckin || !fcmToken) {
-          continue; // skip users without check-ins or no token
-        }
+      // Not due yet?
+      if (nowMin < dueAtMin) continue;
 
-        // If missed check-in
-        if (now - lastCheckin > interval) {
-          const message = {
-            token: fcmToken,
-            notification: {
-              title: "Missed Check-In",
-              body: "You missed your last check-in. " +
-                    "Please check in now!",
-            },
-            data: {
-              userId,
-              type: "missed_checkin",
-            },
+      // Already notified for this due window?
+      const notifiedTs = data.missedNotifiedAt as Timestamp | undefined;
+      if (
+        notifiedTs &&
+        toEpochMinutes(notifiedTs.toMillis()) >= dueAtMin
+      ) {
+        continue;
+      }
+
+      // Send to all devices (filter by role if desired)
+      const devicesSnap =
+        await userDoc.ref.collection("devices").get();
+      if (devicesSnap.empty) continue;
+
+      const payload = {
+        notification: {
+          title: "Missed Check-In",
+          body:
+            "You missed your last check-in. Please check in now!",
+        },
+        data: { userId: uid, type: "missed_checkin" },
+      };
+
+      for (const dev of devicesSnap.docs) {
+        const token = (dev.data() as {token?: string}).token;
+        if (!token) continue;
+
+        try {
+          await messaging.send({ token, ...payload });
+          logger.info(
+            `Sent missed-checkin to user ${uid} ` +
+            `on device ${dev.id}`,
+          );
+        } catch (err: unknown) {
+          const e = err as {
+            errorInfo?: {code?: string};
+            code?: string;
           };
+          const code = e?.errorInfo?.code || e?.code;
 
-          try {
-            await messaging.send(message);
+          logger.error(
+            `Send failed to user ${uid} device ${dev.id}`,
+            err,
+          );
+
+          // Clean up dead tokens
+          if (
+            code === "messaging/registration-token-not-registered" ||
+            code === "messaging/invalid-argument"
+          ) {
+            await dev.ref.delete();
             logger.info(
-              `✅ Notification sent to user ${userId}`
-            );
-          } catch (err) {
-            logger.error(
-              `❌ Failed to send notification to ${userId}`,
-              err
+              `Removed dead device ${dev.id} for user ${uid}`,
             );
           }
         }
       }
-    } catch (err) {
-      logger.error("Error checking missed check-ins", err);
+
+      // Mark this due window as notified (prevents repeats)
+      await userDoc.ref.set(
+        {
+          missedNotifiedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
     }
-  }
+  },
 );
