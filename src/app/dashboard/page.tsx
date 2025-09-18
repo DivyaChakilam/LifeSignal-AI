@@ -48,9 +48,7 @@ import { registerDevice } from "@/lib/useFcmToken";
 
 interface UserDoc {
   lastCheckinAt?: Timestamp;
-  settings?: {
-    checkinInterval?: number | string; // minutes
-  };
+  checkinInterval?: number | string; // minutes
   locationSharing?: boolean;
   sosTriggeredAt?: Timestamp;
   role?: string;
@@ -161,7 +159,7 @@ useEffect(() => {
           setLastCheckIn(null);
         }
 
-        const rawInt = data.settings?.checkinInterval;
+        const rawInt = data.checkinInterval;
         const parsed =
           typeof rawInt === "string"
             ? parseInt(rawInt, 10)
@@ -310,11 +308,7 @@ useEffect(() => {
     try {
       setIntervalMinutes(minutes);
       if (!userRef.current) throw new Error("Not signed in");
-      await setDoc(
-        userRef.current,
-        { settings: { checkinInterval: minutes } },
-        { merge: true }
-      );
+      await updateDoc(userRef.current, { checkinInterval: minutes });
       toast({
         title: "Check-in Interval Updated",
         description: `Your check-in interval has been set to every ${hours} hours.`,

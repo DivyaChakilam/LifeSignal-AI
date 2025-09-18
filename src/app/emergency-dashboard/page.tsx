@@ -14,6 +14,7 @@ import {
   query,
   where,
   doc,
+  getDoc,
   Timestamp,
 } from "firebase/firestore";
 
@@ -33,9 +34,17 @@ import { Badge } from "@/components/ui/badge";
 import { MapPin, Phone, MessageSquare } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-// ✅ import device registration (with role tagging)
+// Centered popup dialog
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
+
+// Push registration + roles
 import { registerDevice } from "@/lib/useFcmToken";
-// (Optional) if you store role on emergency-contact users, you can gate/redirect:
 import { normalizeRole } from "@/lib/roles";
 
 type Status = "OK" | "Inactive" | "SOS";
@@ -47,26 +56,44 @@ type MainUserCard = {
   initials: string;
   status?: Status;
   lastCheckIn?: string;
-  location?: string;
+  location?: string; // address or "lat,lng"
+  colorClass: string;
 };
 
 type MainUserDoc = {
+  firstName?: string;
+  lastName?: string;
+  avatar?: string;
   lastCheckinAt?: Timestamp;
-  checkinInterval?: number | string; // minutes
+  checkinInterval?: number | string;
   sosTriggeredAt?: Timestamp;
-  location?: string;
-  role?: string; // optional if you mirror role here
+  location?: string; // address or "lat,lng"
+  role?: string;
 };
 
-function initialsOf(name = "") {
-  return (
+const userColors = [
+  "bg-red-200",
+  "bg-blue-200",
+  "bg-green-200",
+  "bg-yellow-200",
+  "bg-purple-200",
+  "bg-pink-200",
+];
+
+function initialsAndColor(name = "") {
+  const initials =
     name
       .split(" ")
       .map((p) => p[0])
       .join("")
       .slice(0, 2)
-      .toUpperCase() || "UA"
-  );
+      .toUpperCase() || "UA";
+
+  const colorIndex =
+    name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) %
+    userColors.length;
+
+  return { initials, colorClass: userColors[colorIndex] };
 }
 
 function getStatusVariant(status?: string) {
@@ -102,6 +129,23 @@ function formatWhen(d?: Date | null) {
   return `${d.toLocaleDateString()} ${time}`;
 }
 
+function getMapImage(location?: string) {
+  const FALLBACK = {
+    src: "/images/map-fallback-600x300.png",
+    alt: "Map placeholder",
+  };
+
+  if (!location) return FALLBACK;
+
+  const key = process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY;
+  if (!key) return FALLBACK;
+
+  const q = encodeURIComponent(location.trim());
+  const url = `https://maps.googleapis.com/maps/api/staticmap?center=${q}&zoom=13&size=600x300&maptype=roadmap&markers=color:red|${q}&key=${key}`;
+
+  return { src: url, alt: `Map of ${location}` };
+}
+
 export default function EmergencyDashboardPage() {
   const router = useRouter();
   const { toast } = useToast();
@@ -110,211 +154,183 @@ export default function EmergencyDashboardPage() {
   const [loading, setLoading] = useState(true);
   const [uid, setUid] = useState<string | null>(null);
 
-  // keep latest Firestore unsubscribes (links + per-user by id)
+  // State for centered popup when location is missing
+  const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(
+    null
+  );
+
   const unsubsRef = useRef<Record<string, () => void>>({});
 
-  // cache the latest link info so user-doc listeners always merge with fresh base data
-  const linkInfoRef = useRef<
-    Record<string, { name: string; avatar?: string; location?: string }>
-  >({});
-
-  // gate: only clear loading after the first links snapshot arrives
-  const firstLinksSnapSeenRef = useRef(false);
-
   useEffect(() => {
-    // Main auth subscription
-    const unsubAuth = onAuthStateChanged(auth, (user) => {
-      // clean up all old listeners
-      Object.values(unsubsRef.current).forEach((unsub) => unsub());
+    const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
-      linkInfoRef.current = {};
-      firstLinksSnapSeenRef.current = false;
       setMainUsers([]);
-      setLoading(true);
       setUid(null);
 
       if (!user) {
+        setLoading(false);
         router.replace(
-          `/login?role=emergency_contact&next=${encodeURIComponent("/emergency-dashboard")}`
+          `/login?role=emergency_contact&next=${encodeURIComponent(
+            "/emergency-dashboard"
+          )}`
         );
         return;
       }
 
-      setUid(user.uid); // will trigger device registration effect below
+      try {
+        const meSnap = await getDoc(doc(db, "users", user.uid));
+        const myRole = normalizeRole(
+          meSnap.exists() ? (meSnap.data() as any).role : undefined
+        );
+        if (myRole !== "emergency_contact") {
+          router.replace("/dashboard");
+          return;
+        }
+      } catch {
+        router.replace(
+          `/login?role=emergency_contact&next=${encodeURIComponent(
+            "/emergency-dashboard"
+          )}`
+        );
+        return;
+      }
 
-      // --- Main subscription ---
-      // Listen for all links where this user is the emergency contact.
-      // NOTE: ensure your subcollection id matches exactly (e.g., "emergency_contacts" vs "emergency_contact")
+      setUid(user.uid);
+      setLoading(false);
+
       const linksQuery = query(
         collectionGroup(db, "emergency_contact"),
         where("uid", "==", user.uid)
       );
 
-      unsubsRef.current.links = onSnapshot(
-        linksQuery,
-        (linksSnap) => {
-          firstLinksSnapSeenRef.current = true;
+      unsubsRef.current.links = onSnapshot(linksQuery, (linksSnap) => {
+        const nextMainUserIds = new Set<string>();
 
-          const nextMainUserIds = new Set<string>();
-          const nextLinkInfo: Record<string, { name: string; avatar?: string; location?: string }> =
-            {};
+        linksSnap.forEach((linkDoc) => {
+          const mainUserUid = linkDoc.ref.parent.parent?.id;
+          if (mainUserUid) nextMainUserIds.add(mainUserUid);
+        });
 
-          linksSnap.forEach((linkDoc) => {
-            const data = linkDoc.data() as any;
-
-            // Prefer explicit mainUserId; fallback to parent user id if structured that way.
-            const parentId = linkDoc.ref.parent.parent?.id || "";
-            const mainUserUid: string = data.mainUserId || parentId;
-            if (!mainUserUid) return;
-
-            const name: string = data.mainUserName || "Main User";
-            const avatar: string | undefined = data.mainUserAvatar;
-            const location: string | undefined = data.location;
-
-            nextMainUserIds.add(mainUserUid);
-            nextLinkInfo[mainUserUid] = { name, avatar, location };
-          });
-
-          // Rebuild link cache to include only current ids (removes stale)
-          const rebuilt: Record<string, { name: string; avatar?: string; location?: string }> = {};
-          nextMainUserIds.forEach((id) => {
-            rebuilt[id] = nextLinkInfo[id] || linkInfoRef.current[id] || { name: "Main User" };
-          });
-          linkInfoRef.current = rebuilt;
-
-          // Unsubscribe from main users who are no longer linked
-          Object.keys(unsubsRef.current).forEach((subId) => {
-            if (subId !== "links" && !nextMainUserIds.has(subId)) {
-              unsubsRef.current[subId]();
-              delete unsubsRef.current[subId];
-            }
-          });
-
-          // Seed/update UI from link info immediately
-          setMainUsers((prev) => {
-            const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-            nextMainUserIds.forEach((id) => {
-              const link = linkInfoRef.current[id];
-              const existing = map.get(id);
-              const name = link?.name || existing?.name || "Main User";
-              map.set(id, {
-                mainUserUid: id,
-                name,
-                avatar: link?.avatar || existing?.avatar || "https://placehold.co/100x100.png",
-                initials: initialsOf(name),
-                status: existing?.status,
-                lastCheckIn: existing?.lastCheckIn,
-                location: link?.location ?? existing?.location ?? "",
-              });
-            });
-            // remove cards for users no longer linked
-            Array.from(map.keys()).forEach((id) => {
-              if (!nextMainUserIds.has(id)) map.delete(id);
-            });
-            return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-          });
-
-          if (nextMainUserIds.size === 0) {
-            setLoading(false);
-            return;
+        Object.keys(unsubsRef.current).forEach((k) => {
+          if (k !== "links" && !nextMainUserIds.has(k)) {
+            unsubsRef.current[k]();
+            delete unsubsRef.current[k];
           }
+        });
 
-          // Subscribe to each linked main user's doc for live status
-          nextMainUserIds.forEach((mainUserId) => {
-            if (unsubsRef.current[mainUserId]) return;
+        nextMainUserIds.forEach((mainUserId) => {
+          if (unsubsRef.current[mainUserId]) return;
 
-            const userDocRef = doc(db, "users", mainUserId);
-            unsubsRef.current[mainUserId] = onSnapshot(
-              userDocRef,
-              (userDocSnap) => {
-                const link = linkInfoRef.current[mainUserId] || { name: "Main User" };
-                const baseName = link.name;
-                const baseCard: MainUserCard = {
-                  mainUserUid: mainUserId,
-                  name: baseName,
-                  avatar: link.avatar || "https://placehold.co/100x100.png",
-                  initials: initialsOf(baseName),
-                  location: link.location || "",
-                };
+          const userDocRef = doc(db, "users", mainUserId);
+          unsubsRef.current[mainUserId] = onSnapshot(
+            userDocRef,
+            (userDocSnap) => {
+              const userData = userDocSnap.data() as MainUserDoc;
+              let updatedCard: MainUserCard;
 
-                let updatedCard = { ...baseCard };
+              if (userDocSnap.exists() && userData) {
+                const name =
+                  `${userData.firstName || ""} ${
+                    userData.lastName || ""
+                  }`.trim() || "Main User";
+                const displayName = `${userData.firstName || ""} ${
+                  userData.lastName?.[0] || ""
+                }`.trim();
+                const { initials, colorClass } = initialsAndColor(name);
 
-                if (userDocSnap.exists()) {
-                  const userData = userDocSnap.data() as MainUserDoc;
-                  const last =
-                    userData.lastCheckinAt instanceof Timestamp
-                      ? userData.lastCheckinAt.toDate()
-                      : undefined;
+                const last =
+                  userData.lastCheckinAt instanceof Timestamp
+                    ? userData.lastCheckinAt.toDate()
+                    : undefined;
+                const rawInt = userData.checkinInterval;
+                const intervalMin =
+                  typeof rawInt === "number"
+                    ? rawInt
+                    : parseInt(String(rawInt), 10) || 12 * 60;
 
-                  const rawInt = userData.checkinInterval;
-                  const intervalMin =
-                    typeof rawInt === "number"
-                      ? rawInt
-                      : rawInt
-                      ? parseInt(String(rawInt), 10)
-                      : 12 * 60;
-
-                  let status: Status = "OK";
-                  if (userData.sosTriggeredAt instanceof Timestamp) {
-                    status = "SOS";
-                  } else if (last) {
-                    const nextDue = last.getTime() + intervalMin * 60 * 1000;
-                    if (Date.now() > nextDue) status = "Inactive";
-                  } else {
-                    status = "Inactive";
-                  }
-
-                  updatedCard = {
-                    ...baseCard,
-                    status,
-                    lastCheckIn: formatWhen(last),
-                    location: userData.location || baseCard.location,
-                  };
-
-                  // (Optional) If the main user doc carries a role and it's "primary", we keep as-is.
-                  // If somehow this emergency user has "primary" role, you could redirect them:
-                  // const role = normalizeRole(userData.role);
-                  // if (role === "primary") router.replace("/dashboard");
+                let status: Status = "OK";
+                if (userData.sosTriggeredAt instanceof Timestamp) {
+                  status = "SOS";
+                } else if (last) {
+                  const nextDue = last.getTime() + intervalMin * 60 * 1000;
+                  if (Date.now() > nextDue) status = "Inactive";
+                } else {
+                  status = "Inactive";
                 }
 
-                setMainUsers((prev) => {
-                  const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-                  const existing = map.get(mainUserId);
-                  map.set(mainUserId, { ...existing, ...updatedCard });
-                  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-                });
-
-                setLoading(false);
-              },
-              (error) => {
-                console.error("[Emergency Dashboard] User doc listen failed:", error);
-                setLoading(false);
+                updatedCard = {
+                  mainUserUid: mainUserId,
+                  name: displayName,
+                  avatar: userData.avatar,
+                  initials,
+                  colorClass,
+                  status,
+                  lastCheckIn: formatWhen(last),
+                  location: userData.location || "",
+                };
+              } else {
+                const { initials, colorClass } =
+                  initialsAndColor("User Not Found");
+                updatedCard = {
+                  mainUserUid: mainUserId,
+                  name: "User Not Found",
+                  initials,
+                  colorClass,
+                  avatar: "",
+                  status: "Inactive",
+                };
               }
-            );
-          });
 
-          setLoading(false);
-        },
-        (error) => {
-          console.error("[Emergency Dashboard] Main links query failed:", error);
-          setLoading(false);
-        }
-      );
+              setMainUsers((prev) => {
+                const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                map.set(mainUserId, updatedCard);
+                return Array.from(map.values()).sort((a, b) =>
+                  a.name.localeCompare(b.name)
+                );
+              });
+            },
+            (error) => {
+              console.error(
+                `[Emergency Dashboard] User doc listen failed for ${mainUserId}:`,
+                error
+              );
+              const { initials, colorClass } =
+                initialsAndColor("User Load Error");
+              setMainUsers((prev) => {
+                const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                map.set(mainUserId, {
+                  mainUserUid: mainUserId,
+                  name: "User Load Error",
+                  initials,
+                  colorClass,
+                  status: "Inactive",
+                });
+                return Array.from(map.values()).sort((a, b) =>
+                  a.name.localeCompare(b.name)
+                );
+              });
+            }
+          );
+        });
+
+        setMainUsers((prev) => {
+          const validUids = new Set(nextMainUserIds);
+          return prev.filter((user) => validUids.has(user.mainUserUid));
+        });
+      });
     });
 
     return () => {
       unsubAuth();
-      Object.values(unsubsRef.current).forEach((unsub) => unsub());
+      Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
-      linkInfoRef.current = {};
-      firstLinksSnapSeenRef.current = false;
     };
   }, [router]);
 
-  // ✅ Register THIS device for push on the emergency dashboard
   useEffect(() => {
     if (!uid) return;
-    registerDevice(uid, "emergency"); // users/{uid}/devices/{deviceId} with role = "emergency"
+    registerDevice(uid, "emergency");
   }, [uid]);
 
   const handleAcknowledge = (userName: string) => {
@@ -322,6 +338,19 @@ export default function EmergencyDashboardPage() {
       title: "Alert Acknowledged",
       description: `You are now handling the alert for ${userName}.`,
     });
+  };
+
+  // Open Google Maps if we have a location; otherwise show centered popup.
+  const handleViewOnMap = (user: MainUserCard) => {
+    const loc = (user.location || "").trim();
+    if (!loc) {
+      setNoLocationUser(user);
+      return;
+    }
+    const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+      loc
+    )}`;
+    window.open(mapsUrl, "_blank", "noopener,noreferrer");
   };
 
   return (
@@ -334,74 +363,113 @@ export default function EmergencyDashboardPage() {
 
         {loading && <p>Loading your people…</p>}
         {!loading && mainUsers.length === 0 && (
-          <p className="opacity-70">No linked users yet. Ask them to send you an invite.</p>
+          <p className="opacity-70">
+            No linked users yet. Ask them to send you an invite.
+          </p>
         )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {mainUsers.map((p) => (
-            <Card
-              key={p.mainUserUid}
-              className={`shadow-lg hover:shadow-xl transition-shadow ${
-                p.status === "SOS" ? "border-destructive bg-destructive/10" : ""
-              }`}
-            >
-              <CardHeader className="flex flex-row items-center gap-4">
-                <Avatar className="h-16 w-16">
-                  <AvatarImage src={p.avatar || ""} alt={p.name} />
-                  <AvatarFallback>{p.initials}</AvatarFallback>
-                </Avatar>
-                <div>
-                  <CardTitle className="text-2xl font-headline">{p.name}</CardTitle>
-                  <CardDescription>
-                    {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
-                  </CardDescription>
-                </div>
-              </CardHeader>
-
-              <CardContent className="space-y-4">
-                <div className="flex justify-between items-center">
-                  <p className="font-semibold">Status:</p>
-                  <Badge variant={getStatusVariant(p.status)} className="text-md px-3 py-1">
-                    {p.status || "—"}
-                  </Badge>
-                </div>
-
-                <div className="relative h-40 w-full rounded-lg overflow-hidden border">
-                  <Image
-                    src="https://placehold.co/400x200.png"
-                    alt="Map view"
-                    fill
-                    style={{ objectFit: "cover" }}
-                  />
-                  <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
-                    <Button variant="secondary">
-                      <MapPin className="mr-2 h-4 w-4" />
-                      View on Map
-                    </Button>
+          {mainUsers.map((p) => {
+            const map = getMapImage(p.location);
+            return (
+              <Card
+                key={p.mainUserUid}
+                className={`shadow-lg hover:shadow-xl transition-shadow ${
+                  p.status === "SOS"
+                    ? "border-destructive bg-destructive/10"
+                    : ""
+                }`}
+              >
+                <CardHeader className="flex flex-row items-center gap-4">
+                  <Avatar className="h-16 w-16">
+                    <AvatarImage src={p.avatar || ""} alt={p.name} />
+                    <AvatarFallback className={`${p.colorClass} text-foreground`}>
+                      {p.initials}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div>
+                    <CardTitle className="text-2xl font-headline">
+                      {p.name}
+                    </CardTitle>
+                    <CardDescription>
+                      {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
+                    </CardDescription>
                   </div>
-                </div>
-              </CardContent>
+                </CardHeader>
 
-              <CardFooter className="grid grid-cols-2 gap-2">
-                <Button variant="outline">
-                  <Phone className="mr-2 h-4 w-4" />
-                  Call
-                </Button>
-                <Button variant="outline">
-                  <MessageSquare className="mr-2 h-4 w-4" />
-                  Message
-                </Button>
-                {p.status === "SOS" && (
-                  <Button className="col-span-2" onClick={() => handleAcknowledge(p.name)}>
-                    Acknowledge Alert
+                <CardContent className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <p className="font-semibold">Status:</p>
+                    <Badge
+                      variant={getStatusVariant(p.status)}
+                      className="text-md px-3 py-1"
+                    >
+                      {p.status || "—"}
+                    </Badge>
+                  </div>
+
+                  <div className="relative h-40 w-full rounded-lg overflow-hidden border">
+                    <Image
+                      src={map.src}
+                      alt={map.alt}
+                      fill
+                      sizes="(max-width: 768px) 100vw, 33vw"
+                      style={{ objectFit: "cover" }}
+                    />
+                    <div className="absolute inset-0 bg-black/20 flex items-center justify-center">
+                      <Button
+                        variant="secondary"
+                        onClick={() => handleViewOnMap(p)}
+                        aria-label={`View ${p.name} on map`}
+                      >
+                        <MapPin className="mr-2 h-4 w-4" />
+                        View on Map
+                      </Button>
+                    </div>
+                  </div>
+                </CardContent>
+
+                <CardFooter className="grid grid-cols-2 gap-2">
+                  <Button variant="outline">
+                    <Phone className="mr-2 h-4 w-4" />
+                    Call
                   </Button>
-                )}
-              </CardFooter>
-            </Card>
-          ))}
+                  <Button variant="outline">
+                    <MessageSquare className="mr-2 h-4 w-4" />
+                    Message
+                  </Button>
+                  {p.status === "SOS" && (
+                    <Button
+                      className="col-span-2"
+                      onClick={() => handleAcknowledge(p.name)}
+                    >
+                      Acknowledge Alert
+                    </Button>
+                  )}
+                </CardFooter>
+              </Card>
+            );
+          })}
         </div>
       </main>
       <Footer />
+
+      {/* Centered popup when location is missing */}
+      <Dialog
+        open={!!noLocationUser}
+        onOpenChange={(open) => !open && setNoLocationUser(null)}
+      >
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>Location unavailable</DialogTitle>
+            <DialogDescription>
+              {noLocationUser
+                ? `${noLocationUser.name} disabled location sharing or hasn’t shared a location yet.`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

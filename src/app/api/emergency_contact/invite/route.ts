@@ -1,4 +1,4 @@
-// src/app/api/emergency_contact/resend/route.ts
+// src/app/api/emergency_contact/invite/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import crypto from "crypto";
@@ -25,8 +25,8 @@ async function requireMainUser(req: NextRequest) {
     throw new Error("UNAUTHENTICATED");
   }
 
-  const snap = await db.doc(`users/${decoded.uid}`).get();
-  const role = normalizeRole((snap.data() as any)?.role);
+  const userSnap = await db.doc(`users/${decoded.uid}`).get();
+  const role = normalizeRole((userSnap.data() as any)?.role);
   if (!isMainUserRole(role)) throw new Error("NOT_AUTHORIZED");
 
   return { uid: decoded.uid as string };
@@ -39,6 +39,8 @@ function getOrigin(req: NextRequest) {
     new URL(req.url).origin
   );
 }
+
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export async function POST(req: NextRequest) {
   try {
@@ -54,28 +56,45 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Email required" }, { status: 400 });
     }
 
+    // Deterministic per (mainUserId, email) doc to track status
     const emergencyContactId = `${mainUserId}_${emergencyContactEmail}`;
     const emergencyContactRef = db.doc(`emergencyContacts/${emergencyContactId}`);
     const ecSnap = await emergencyContactRef.get();
+    const ecStatus = ecSnap.exists ? (ecSnap.get("status") as string) : undefined;
 
+    // If already linked/active, do not send another invite
+    if (ecStatus === "ACTIVE") {
+      return NextResponse.json({
+        ok: true,
+        alreadyLinked: true,
+        emergencyContactId,
+      });
+    }
+
+    // We now ALWAYS issue a fresh invite for PENDING (or missing) contacts.
+    // (Old code returned early and never sent a new link.)
     let mainUserName = "";
     let mainUserAvatar = "";
     try {
       const mu = await db.doc(`users/${mainUserId}`).get();
       const m = mu.data() as any;
-      mainUserName = m?.displayName || m?.name || "";
-      mainUserAvatar = m?.photoURL || m?.avatar || "";
-    } catch {}
+      mainUserName = m?.displayName || "";
+      mainUserAvatar = m?.photoURL || "";
+    } catch {
+      // ignore
+    }
 
+    // Fresh token + 7-day expiry
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
 
     const batch = db.batch();
 
+    // Create a NEW invite doc every time (distinct ID)
     const inviteRef = db.collection("invites").doc();
     batch.set(inviteRef, {
-      userId: mainUserId,
+      mainUserId: mainUserId,
       role: "emergency_contact",
       emergencyContactEmail,
       relation,
@@ -87,18 +106,18 @@ export async function POST(req: NextRequest) {
       mainUserAvatar,
       createdAt: FieldValue.serverTimestamp(),
       acceptedAt: null,
-      expiresAt,
+      expiresAt, // storing Date is fine in admin SDK
     });
 
-    // Preserve ACTIVE status if already accepted; otherwise set/keep PENDING.
-    let nextStatus: "ACTIVE" | "PENDING" = "PENDING";
-    if (ecSnap.exists && ecSnap.get("status") === "ACTIVE") nextStatus = "ACTIVE";
-
+    // Upsert/refresh the emergencyContact tracker doc
+    const resendCount = (ecSnap.exists ? ecSnap.get("resendCount") : 0) || 0;
     const ecPayload: any = {
       id: emergencyContactId,
       mainUserId,
       emergencyContactEmail,
-      status: nextStatus,
+      status: "PENDING", // remains pending until accept route finalizes
+      lastInviteAt: FieldValue.serverTimestamp(),
+      resendCount: resendCount + 1,
       updatedAt: FieldValue.serverTimestamp(),
     };
     if (!ecSnap.exists) {
@@ -111,8 +130,10 @@ export async function POST(req: NextRequest) {
 
     const origin = getOrigin(req);
     const acceptUrl = `${origin}/emergency_contact/accept?invite=${inviteRef.id}&token=${token}`;
+    // Optional: if you want to force email verification before accept, keep this:
     const verifyContinue = `${origin}/verify-email?next=${encodeURIComponent(acceptUrl)}`;
 
+    // Send email via your Mail collection (kept from your original code)
     await db.collection("mail").add({
       to: [emergencyContactEmail],
       message: {
@@ -121,7 +142,7 @@ export async function POST(req: NextRequest) {
           <p>Hello${name ? " " + name : ""},</p>
           <p>You’ve been invited to be an <strong>emergency contact</strong>.</p>
           <p><a href="${acceptUrl}">Accept invitation</a> (link expires in 7 days).</p>
-          <p>If the link doesn't work, copy this URL:<br>${acceptUrl}</p>
+          <p>If the link doesn\'t work, copy this URL:<br>${acceptUrl}</p>
         `,
       },
     });
@@ -132,6 +153,7 @@ export async function POST(req: NextRequest) {
       acceptUrl,
       verifyContinue,
       emergencyContactId,
+      wasResent: ecStatus === "PENDING" || !ecSnap.exists ? true : false,
     });
   } catch (e: any) {
     if (e?.message === "UNAUTHENTICATED") {
@@ -141,9 +163,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Not authorized" }, { status: 403 });
     }
     console.error(e);
-    return NextResponse.json(
-      { error: e?.message ?? "Resend failed" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: e?.message ?? "Invite failed" }, { status: 400 });
   }
 }

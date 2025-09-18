@@ -1,4 +1,3 @@
-// app/login/page.tsx
 "use client";
 
 import Link from "next/link";
@@ -29,15 +28,22 @@ const loginSchema = z.object({
   password: z.string().min(1, { message: "Password is required." }),
 });
 
+// A utility function that determines the correct next page, sanitizing the URL.
 function safeNext(n: string | null | undefined, fallbackRole: Role) {
-  if (n && n.startsWith("/")) return n; // same-site only
+  // Only allow redirects to same-site paths.
+  if (n && n.startsWith("/")) return n;
+  // Redirect to the default dashboard based on the inferred role from the URL.
   return fallbackRole === "emergency_contact" ? "/emergency-dashboard" : "/dashboard";
 }
 
+// A utility function to fetch the user's actual role from Firestore.
 async function fetchActualRole(uid: string, fallback: Role): Promise<Role> {
   try {
+    // Fetches the user document from Firestore.
     const snap = await getDoc(doc(db, "users", uid));
+    // Extracts the role from the document data.
     const r = snap.exists() ? (snap.data() as any).role : undefined;
+    // Returns the normalized role or a fallback.
     return normalizeRole(r) ?? fallback;
   } catch {
     return fallback;
@@ -50,16 +56,17 @@ export default function LoginPage() {
   const { toast } = useToast();
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Query params we honor
+  // Retrieves query parameters from the URL.
   const roleFromUrl: Role = normalizeRole(params.get("role")) ?? "main_user";
-  const token = params.get("token") || ""; // optional invite token
-  const explicitNext = params.get("next"); // may be null/invalid
+  const token = params.get("token") || "";
+  const explicitNext = params.get("next");
 
   const form = useForm<z.infer<typeof loginSchema>>({
     resolver: zodResolver(loginSchema),
     defaultValues: { email: "", password: "" },
   });
 
+  // A helper function to create a server-side session cookie for API routes.
   const setSessionCookie = async () => {
     const u = auth.currentUser;
     if (!u) return;
@@ -73,6 +80,7 @@ export default function LoginPage() {
     if (!res.ok) throw new Error("Failed to set session");
   };
 
+  // A helper function to automatically accept an invite token if one exists.
   const maybeAutoAcceptInvite = async () => {
     if (!token) return;
     try {
@@ -83,7 +91,7 @@ export default function LoginPage() {
         body: JSON.stringify({ token }),
       });
     } catch {
-      // Non-fatal; verify-email/accept page can still handle it later
+      // Ignore errors; the verify-email or accept page can handle it.
     }
   };
 
@@ -91,29 +99,39 @@ export default function LoginPage() {
     try {
       setIsSubmitting(true);
 
+      // 1. Sign in the user with Firebase Auth.
       const { user } = await signInWithEmailAndPassword(
         auth,
         values.email.trim().toLowerCase(),
         values.password
       );
 
-      // Authorize API routes
+      // 2. Authorize API routes by setting a session cookie.
       await setSessionCookie();
 
-      // Try to accept invite token if present
-      await maybeAutoAcceptInvite();
-
-      // Resolve final role (from Firestore) and destination
+      // 3. ✨ CRITICAL CHANGE: Fetch the actual role from Firestore.
+      // This ensures the redirection is based on the database, not the URL.
       const actualRole = await fetchActualRole(user.uid, roleFromUrl);
-      const destination = safeNext(explicitNext, actualRole);
 
+      // 4. Determine the correct destination based on the actual role.
+      const destination =
+        explicitNext && explicitNext.startsWith("/")
+          ? explicitNext
+          : actualRole === "emergency_contact"
+          ? "/emergency-dashboard"
+          : "/dashboard";
+
+      // 5. Redirect the user to the correct dashboard.
+      router.replace(destination);
+
+      // 6. Asynchronous operations after redirect.
       toast({
         title: "Login Successful",
         description: `Welcome back, ${user.email ?? "user"}!`,
       });
-
-      router.replace(destination);
+      await maybeAutoAcceptInvite();
     } catch (err: any) {
+      // Error handling
       const code = err?.code as string | undefined;
       let message = "Something went wrong. Please try again.";
       if (code === "auth/invalid-email") message = "Invalid email address.";
@@ -127,7 +145,7 @@ export default function LoginPage() {
     }
   };
 
-  // Precompute the link to signup (preserve role/next/token safely)
+  // Precomputes the link to the signup page.
   const signupNext = safeNext(explicitNext, roleFromUrl);
 
   return (
