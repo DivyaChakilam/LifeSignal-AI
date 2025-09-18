@@ -1,3 +1,4 @@
+// app/login/page.tsx
 "use client";
 
 import Link from "next/link";
@@ -99,39 +100,33 @@ export default function LoginPage() {
     try {
       setIsSubmitting(true);
 
-      // 1. Sign in the user with Firebase Auth.
+      // 1. Sign in the user with Firebase Auth. This is the first step.
       const { user } = await signInWithEmailAndPassword(
         auth,
         values.email.trim().toLowerCase(),
         values.password
       );
 
-      // 2. Authorize API routes by setting a session cookie.
+      // 2. Authorize API routes by setting a session cookie. This is critical for server-side operations.
       await setSessionCookie();
 
-      // 3. ✨ CRITICAL CHANGE: Fetch the actual role from Firestore.
-      // This ensures the redirection is based on the database, not the URL.
-      const actualRole = await fetchActualRole(user.uid, roleFromUrl);
-
-      // 4. Determine the correct destination based on the actual role.
-      const destination =
-        explicitNext && explicitNext.startsWith("/")
-          ? explicitNext
-          : actualRole === "emergency_contact"
-          ? "/emergency-dashboard"
-          : "/dashboard";
-
-      // 5. Redirect the user to the correct dashboard.
+      // 3. Immediately redirect the user based on the inferred role from the URL.
+      // This is the key change to solve the delay.
+      const destination = safeNext(explicitNext, roleFromUrl);
       router.replace(destination);
 
-      // 6. Asynchronous operations after redirect.
+      // 4. (Asynchronous operation) Display a success toast notification.
       toast({
         title: "Login Successful",
         description: `Welcome back, ${user.email ?? "user"}!`,
       });
+
+      // 5. (Asynchronous operation) Attempt to auto-accept the invite.
+      // This happens *after* the redirect to ensure the page loads quickly.
       await maybeAutoAcceptInvite();
+
     } catch (err: any) {
-      // Error handling
+      // Error handling for login failures.
       const code = err?.code as string | undefined;
       let message = "Something went wrong. Please try again.";
       if (code === "auth/invalid-email") message = "Invalid email address.";
@@ -141,6 +136,7 @@ export default function LoginPage() {
         message = "Too many attempts. Please wait and try again.";
       toast({ title: "Login failed", description: message, variant: "destructive" });
     } finally {
+      // Always stop the submitting state to re-enable the form.
       setIsSubmitting(false);
     }
   };
