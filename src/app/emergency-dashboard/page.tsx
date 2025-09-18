@@ -1,4 +1,3 @@
-// app/emergency-dashboard/page.tsx
 "use client";
 
 import Image from "next/image";
@@ -7,7 +6,6 @@ import { useRouter } from "next/navigation";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db } from "@/firebase";
 
-// Firestore
 import {
   collectionGroup,
   onSnapshot,
@@ -31,10 +29,10 @@ import {
 } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { MapPin, Phone, MessageSquare } from "lucide-react";
+import { MapPin, Phone, MessageSquare, Settings } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-// Centered popup dialog
+// Centered popup dialog (keeps location popup)
 import {
   Dialog,
   DialogContent,
@@ -46,6 +44,9 @@ import {
 // Push registration + roles
 import { registerDevice } from "@/lib/useFcmToken";
 import { normalizeRole } from "@/lib/roles";
+
+// User settings dialog (the new component you will create)
+import { UserSettingsDialog } from "@/components/UserSettingsDialog";
 
 type Status = "OK" | "Inactive" | "SOS";
 
@@ -159,6 +160,11 @@ export default function EmergencyDashboardPage() {
     null
   );
 
+  // Settings popup control: store which mainUser is being edited
+  const [settingsUser, setSettingsUser] = useState<
+    { mainUserUid: string; emergencyContactUid: string } | null
+  >(null);
+
   const unsubsRef = useRef<Record<string, () => void>>({});
 
   useEffect(() => {
@@ -167,6 +173,7 @@ export default function EmergencyDashboardPage() {
       unsubsRef.current = {};
       setMainUsers([]);
       setUid(null);
+      setSettingsUser(null);
 
       if (!user) {
         setLoading(false);
@@ -208,10 +215,12 @@ export default function EmergencyDashboardPage() {
         const nextMainUserIds = new Set<string>();
 
         linksSnap.forEach((linkDoc) => {
+          // `linkDoc.ref.parent.parent` should be users/{mainUserId}/emergency_contact/{docId}
           const mainUserUid = linkDoc.ref.parent.parent?.id;
           if (mainUserUid) nextMainUserIds.add(mainUserUid);
         });
 
+        // remove listeners for users that are no longer linked
         Object.keys(unsubsRef.current).forEach((k) => {
           if (k !== "links" && !nextMainUserIds.has(k)) {
             unsubsRef.current[k]();
@@ -219,6 +228,7 @@ export default function EmergencyDashboardPage() {
           }
         });
 
+        // add listeners for new linked users
         nextMainUserIds.forEach((mainUserId) => {
           if (unsubsRef.current[mainUserId]) return;
 
@@ -231,9 +241,8 @@ export default function EmergencyDashboardPage() {
 
               if (userDocSnap.exists() && userData) {
                 const name =
-                  `${userData.firstName || ""} ${
-                    userData.lastName || ""
-                  }`.trim() || "Main User";
+                  `${userData.firstName || ""} ${userData.lastName || ""}`.trim() ||
+                  "Main User";
                 const displayName = `${userData.firstName || ""} ${
                   userData.lastName?.[0] || ""
                 }`.trim();
@@ -270,8 +279,7 @@ export default function EmergencyDashboardPage() {
                   location: userData.location || "",
                 };
               } else {
-                const { initials, colorClass } =
-                  initialsAndColor("User Not Found");
+                const { initials, colorClass } = initialsAndColor("User Not Found");
                 updatedCard = {
                   mainUserUid: mainUserId,
                   name: "User Not Found",
@@ -295,8 +303,7 @@ export default function EmergencyDashboardPage() {
                 `[Emergency Dashboard] User doc listen failed for ${mainUserId}:`,
                 error
               );
-              const { initials, colorClass } =
-                initialsAndColor("User Load Error");
+              const { initials, colorClass } = initialsAndColor("User Load Error");
               setMainUsers((prev) => {
                 const map = new Map(prev.map((u) => [u.mainUserUid, u]));
                 map.set(mainUserId, {
@@ -314,6 +321,7 @@ export default function EmergencyDashboardPage() {
           );
         });
 
+        // filter out any users that are no longer in the links
         setMainUsers((prev) => {
           const validUids = new Set(nextMainUserIds);
           return prev.filter((user) => validUids.has(user.mainUserUid));
@@ -375,25 +383,40 @@ export default function EmergencyDashboardPage() {
               <Card
                 key={p.mainUserUid}
                 className={`shadow-lg hover:shadow-xl transition-shadow ${
-                  p.status === "SOS"
-                    ? "border-destructive bg-destructive/10"
-                    : ""
+                  p.status === "SOS" ? "border-destructive bg-destructive/10" : ""
                 }`}
               >
-                <CardHeader className="flex flex-row items-center gap-4">
-                  <Avatar className="h-16 w-16">
-                    <AvatarImage src={p.avatar || ""} alt={p.name} />
-                    <AvatarFallback className={`${p.colorClass} text-foreground`}>
-                      {p.initials}
-                    </AvatarFallback>
-                  </Avatar>
+                <CardHeader className="flex flex-row items-center gap-4 justify-between">
+                  <div className="flex items-center gap-4">
+                    <Avatar className="h-16 w-16">
+                      <AvatarImage src={p.avatar || ""} alt={p.name} />
+                      <AvatarFallback className={`${p.colorClass} text-foreground`}>
+                        {p.initials}
+                      </AvatarFallback>
+                    </Avatar>
+                    <div>
+                      <CardTitle className="text-2xl font-headline">{p.name}</CardTitle>
+                      <CardDescription>
+                        {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
+                      </CardDescription>
+                    </div>
+                  </div>
+
+                  {/* Settings gear button (opens UserSettingsDialog modal) */}
                   <div>
-                    <CardTitle className="text-2xl font-headline">
-                      {p.name}
-                    </CardTitle>
-                    <CardDescription>
-                      {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
-                    </CardDescription>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() =>
+                        setSettingsUser({
+                          mainUserUid: p.mainUserUid,
+                          emergencyContactUid: uid || "", // logged-in emergency contact uid
+                        })
+                      }
+                      aria-label={`Settings for ${p.name}`}
+                    >
+                      <Settings className="h-5 w-5" />
+                    </Button>
                   </div>
                 </CardHeader>
 
@@ -453,6 +476,16 @@ export default function EmergencyDashboardPage() {
         </div>
       </main>
       <Footer />
+
+      {/* Settings dialog (controlled) */}
+      <UserSettingsDialog
+        mainUserUid={settingsUser?.mainUserUid || ""}
+        emergencyContactUid={settingsUser?.emergencyContactUid || ""}
+        open={!!settingsUser}
+        onOpenChange={(open) => {
+          if (!open) setSettingsUser(null);
+        }}
+      />
 
       {/* Centered popup when location is missing */}
       <Dialog
