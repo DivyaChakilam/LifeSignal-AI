@@ -43,7 +43,7 @@ import { Siren, CheckCircle2, Timer, Clock } from "lucide-react";
 // roles
 import { normalizeRole } from "@/lib/roles";
 
-// ✅ device registration (primary role for this dashboard)
+// push device registration
 import { registerDevice } from "@/lib/useFcmToken";
 
 interface UserDoc {
@@ -56,6 +56,9 @@ interface UserDoc {
 
 type Status = "safe" | "missed" | "unknown";
 
+// helper to compute minutes-since-epoch
+const toEpochMinutes = (ms: number) => Math.floor(ms / 60000);
+
 export default function DashboardPage() {
   const router = useRouter();
   const { toast } = useToast();
@@ -66,53 +69,50 @@ export default function DashboardPage() {
   const [timeLeft, setTimeLeft] = useState<string>("");
   const [locationSharing, setLocationSharing] = useState<boolean | null>(null);
   const [roleChecked, setRoleChecked] = useState(false);
-  const [uid, setUid] = useState<string | null>(null);
+
+  // 👇 renamed to mainUserUid for clarity
+  const [mainUserUid, setMainUserUid] = useState<string | null>(null);
 
   const userDocUnsubRef = useRef<(() => void) | null>(null);
   const userRef = useRef<ReturnType<typeof doc> | null>(null);
 
-// Show OS banner even when the tab is focused
-useEffect(() => {
-  let unsub: (() => void) | undefined;
+  // Handle push notifications while app is open
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
 
-  (async () => {
-    const { isSupported, getMessaging, onMessage } = await import('firebase/messaging');
-    if (!(await isSupported())) return;
+    (async () => {
+      const { isSupported, getMessaging, onMessage } = await import("firebase/messaging");
+      if (!(await isSupported())) return;
 
-    // reuse your initialized app via dynamic import of your firebase module
-    const { initializeApp, getApps } = await import('firebase/app');
-    const apps = getApps();
-    const app = apps.length
-      ? apps[0]
-      : initializeApp({
-          apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
-          authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
-          projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
-          messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
-          appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
-        });
+      const { initializeApp, getApps } = await import("firebase/app");
+      const apps = getApps();
+      const app = apps.length
+        ? apps[0]
+        : initializeApp({
+            apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
+            authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN!,
+            projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID!,
+            messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
+            appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
+          });
 
-    const messaging = getMessaging(app);
+      const messaging = getMessaging(app);
 
-    unsub = onMessage(messaging, async (payload) => {
-      const reg = await navigator.serviceWorker.ready;
-      const title = payload.notification?.title || payload.data?.title || 'Notification';
-      const body  = payload.notification?.body  || payload.data?.body  || '';
-      const url   = payload.fcmOptions?.link    || payload.data?.url    || '/';
-      reg.showNotification(title, { body, data: { url } });
-    });
-  })();
+      unsub = onMessage(messaging, async (payload) => {
+        const reg = await navigator.serviceWorker.ready;
+        const title = payload.notification?.title || payload.data?.title || "Notification";
+        const body = payload.notification?.body || payload.data?.body || "";
+        const url = payload.fcmOptions?.link || payload.data?.url || "/";
+        reg.showNotification(title, { body, data: { url } });
+      });
+    })();
 
-  return () => unsub?.();
-}, []);
+    return () => unsub?.();
+  }, []);
 
-
-
-
-  // Auth + Firestore subscription
+  // 🔑 Auth + Firestore subscription
   useEffect(() => {
     const offAuth = onAuthStateChanged(auth, async (user) => {
-      // clean old listener
       if (userDocUnsubRef.current) {
         userDocUnsubRef.current();
         userDocUnsubRef.current = null;
@@ -120,7 +120,7 @@ useEffect(() => {
 
       if (!user) {
         userRef.current = null;
-        setUid(null);
+        setMainUserUid(null); // reset UID
         setLastCheckIn(null);
         setIntervalMinutes(12 * 60);
         setStatus("unknown");
@@ -130,11 +130,10 @@ useEffect(() => {
         return;
       }
 
-      setUid(user.uid);
+      setMainUserUid(user.uid); // store main user UID
       const uref = doc(db, "users", user.uid);
       userRef.current = uref;
 
-      // Ensure doc exists so later updates don't fail
       await setDoc(uref, { createdAt: serverTimestamp() }, { merge: true });
 
       const unsub = onSnapshot(uref, (snap) => {
@@ -144,7 +143,7 @@ useEffect(() => {
         }
         const data = snap.data() as UserDoc;
 
-        // Gate by role: emergency contacts aren't allowed here
+        // 🚫 Prevent emergency contacts from seeing this dashboard
         const r = normalizeRole(data.role);
         if (r === "emergency_contact") {
           router.replace("/emergency-dashboard");
@@ -166,9 +165,7 @@ useEffect(() => {
             : typeof rawInt === "number"
             ? rawInt
             : NaN;
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          setIntervalMinutes(parsed);
-        }
+        if (!Number.isNaN(parsed) && parsed > 0) setIntervalMinutes(parsed);
 
         if (typeof data.locationSharing === "boolean") {
           setLocationSharing(data.locationSharing);
@@ -187,21 +184,19 @@ useEffect(() => {
     };
   }, [router]);
 
-  // ✅ Register this device for push in the main dashboard (role: "primary")
+  // Register device for push under this main user
   useEffect(() => {
-    if (!roleChecked || !uid) return;
-    // Only run registration when we're definitively on the primary dashboard
-    // (If you also use role in UI state, you could gate it further.)
-    registerDevice(uid, "primary"); // stores token under users/{uid}/devices/{deviceId} with role: "primary"
-  }, [roleChecked, uid]);
+    if (!roleChecked || !mainUserUid) return;
+    registerDevice(mainUserUid, "primary");
+  }, [roleChecked, mainUserUid]);
 
-  // Derived next check-in time
+  // Compute next check-in time
   const nextCheckIn = useMemo(() => {
     if (!lastCheckIn) return null;
     return new Date(lastCheckIn.getTime() + intervalMinutes * 60 * 1000);
   }, [lastCheckIn, intervalMinutes]);
 
-  // Countdown + status
+  // Countdown + status updater
   useEffect(() => {
     if (!nextCheckIn) {
       setStatus("unknown");
@@ -237,7 +232,7 @@ useEffect(() => {
     return () => clearInterval(id);
   }, [nextCheckIn]);
 
-  // ---- UI helpers & actions ----
+  // --- UI helpers ---
   const formatWhen = (d: Date | null) => {
     if (!d) return "—";
     const now = new Date();
@@ -258,28 +253,11 @@ useEffect(() => {
     return `${d.toLocaleDateString()} ${time}`;
   };
 
-  const handleCheckIn = async () => {
-    try {
-      if (!userRef.current) throw new Error("Not signed in");
-      // optimistic UI
-      setLastCheckIn(new Date());
-      await updateDoc(userRef.current, {
-        lastCheckinAt: serverTimestamp(),
-      });
-      toast({ title: "Checked In!", description: "Your status has been updated to 'OK'." });
-    } catch (e: any) {
-      toast({
-        title: "Check-in failed",
-        description: e?.message ?? "Please try again.",
-        variant: "destructive",
-      });
-    }
-  };
-
+  // 🚨 SOS button
   const handleSOS = async () => {
     try {
       if (!userRef.current) throw new Error("Not signed in");
-    await updateDoc(userRef.current, {
+      await updateDoc(userRef.current, {
         sosTriggeredAt: serverTimestamp(),
       });
       toast({
@@ -296,6 +274,36 @@ useEffect(() => {
     }
   };
 
+  // ✅ Manual check-in
+  const handleCheckIn = async () => {
+    try {
+      if (!userRef.current) throw new Error("Not signed in");
+
+      const intervalMin =
+        Number.isFinite(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 720;
+
+      const dueAtMin = toEpochMinutes(Date.now()) + intervalMin;
+
+      setLastCheckIn(new Date()); // optimistic UI
+
+      await updateDoc(userRef.current, {
+        checkinEnabled: true,
+        lastCheckinAt: serverTimestamp(),
+        dueAtMin,
+        missedNotifiedAt: null,
+      });
+
+      toast({ title: "Checked In!", description: "Your status has been updated to 'OK'." });
+    } catch (e: any) {
+      toast({
+        title: "Check-in failed",
+        description: e?.message ?? "Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  // Update interval + recompute dueAtMin
   const HOURS_OPTIONS = [1, 2, 3, 6, 10, 12, 18, 24] as const;
   const selectedHours = useMemo(() => {
     const h = Math.round(intervalMinutes / 60);
@@ -308,7 +316,15 @@ useEffect(() => {
     try {
       setIntervalMinutes(minutes);
       if (!userRef.current) throw new Error("Not signed in");
-      await updateDoc(userRef.current, { checkinInterval: minutes });
+
+      const baseMs = lastCheckIn?.getTime?.() ?? Date.now();
+      const newDueAtMin = toEpochMinutes(baseMs) + minutes;
+
+      await updateDoc(userRef.current, {
+        checkinInterval: minutes,
+        dueAtMin: newDueAtMin,
+      });
+
       toast({
         title: "Check-in Interval Updated",
         description: `Your check-in interval has been set to every ${hours} hours.`,
@@ -322,7 +338,7 @@ useEffect(() => {
     }
   };
 
-  // Don't flash dashboard before we confirm role
+  // Prevent flashing dashboard before role check
   if (!roleChecked) {
     return (
       <div className="flex flex-col min-h-screen bg-secondary">
@@ -343,6 +359,7 @@ useEffect(() => {
     );
   }
 
+  // --- UI ---
   return (
     <div className="flex flex-col min-h-screen bg-secondary">
       <Header />
@@ -355,7 +372,9 @@ useEffect(() => {
             <Card className="text-center bg-destructive/10 border-destructive shadow-lg hover:shadow-xl transition-shadow">
               <CardHeader>
                 <CardTitle className="text-3xl font-headline text-destructive">Emergency SOS</CardTitle>
-                <CardDescription className="text-destructive/80">Tap only in a real emergency.</CardDescription>
+                <CardDescription className="text-destructive/80">
+                  Tap only in a real emergency.
+                </CardDescription>
               </CardHeader>
               <CardContent>
                 <Button
@@ -471,7 +490,7 @@ useEffect(() => {
               </CardContent>
             </Card>
 
-            {/* Contacts */}
+            {/* Emergency Contacts */}
             <div className="md:col-span-2">
               <EmergencyContacts />
             </div>
@@ -495,3 +514,4 @@ useEffect(() => {
     </div>
   );
 }
+

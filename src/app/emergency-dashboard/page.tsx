@@ -1,3 +1,4 @@
+// app/emergency-dashboard/page.tsx
 "use client";
 
 import Image from "next/image";
@@ -6,6 +7,7 @@ import { useRouter } from "next/navigation";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db } from "@/firebase";
 
+// Firestore
 import {
   collectionGroup,
   onSnapshot,
@@ -14,6 +16,10 @@ import {
   doc,
   getDoc,
   Timestamp,
+  type Unsubscribe,
+  type Query as FsQuery,
+  type QuerySnapshot,
+  type DocumentData,
 } from "firebase/firestore";
 
 import { Header } from "@/components/header";
@@ -29,10 +35,10 @@ import {
 } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { MapPin, Phone, MessageSquare, Settings } from "lucide-react";
+import { MapPin, Phone, MessageSquare, Settings as SettingsIcon } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-// Centered popup dialog (keeps location popup)
+// Centered popup dialog
 import {
   Dialog,
   DialogContent,
@@ -45,12 +51,10 @@ import {
 import { registerDevice } from "@/lib/useFcmToken";
 import { normalizeRole } from "@/lib/roles";
 
-// User settings dialog (the new component you will create)
-import { UserSettingsDialog } from "@/components/UserSettingsDialog";
+// ---------------------- Types ----------------------
+export type Status = "OK" | "Inactive" | "SOS";
 
-type Status = "OK" | "Inactive" | "SOS";
-
-type MainUserCard = {
+export type MainUserCard = {
   mainUserUid: string;
   name: string;
   avatar?: string;
@@ -61,7 +65,7 @@ type MainUserCard = {
   colorClass: string;
 };
 
-type MainUserDoc = {
+export type MainUserDoc = {
   firstName?: string;
   lastName?: string;
   avatar?: string;
@@ -70,8 +74,10 @@ type MainUserDoc = {
   sosTriggeredAt?: Timestamp;
   location?: string; // address or "lat,lng"
   role?: string;
+  dueAtMin?: number; // materialized next deadline (minutes since epoch)
 };
 
+// ---------------------- Helpers ----------------------
 const userColors = [
   "bg-red-200",
   "bg-blue-200",
@@ -91,8 +97,7 @@ function initialsAndColor(name = "") {
       .toUpperCase() || "UA";
 
   const colorIndex =
-    name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) %
-    userColors.length;
+    name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) % userColors.length;
 
   return { initials, colorClass: userColors[colorIndex] };
 }
@@ -134,7 +139,7 @@ function getMapImage(location?: string) {
   const FALLBACK = {
     src: "/images/map-fallback-600x300.png",
     alt: "Map placeholder",
-  };
+  } as const;
 
   if (!location) return FALLBACK;
 
@@ -144,202 +149,193 @@ function getMapImage(location?: string) {
   const q = encodeURIComponent(location.trim());
   const url = `https://maps.googleapis.com/maps/api/staticmap?center=${q}&zoom=13&size=600x300&maptype=roadmap&markers=color:red|${q}&key=${key}`;
 
-  return { src: url, alt: `Map of ${location}` };
+  return { src: url, alt: `Map of ${location}` } as const;
 }
 
+// ---------------------- Page ----------------------
 export default function EmergencyDashboardPage() {
   const router = useRouter();
   const { toast } = useToast();
 
   const [mainUsers, setMainUsers] = useState<MainUserCard[]>([]);
   const [loading, setLoading] = useState(true);
-  const [uid, setUid] = useState<string | null>(null);
 
-  // State for centered popup when location is missing
-  const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(
-    null
-  );
+  // ✅ renamed to the canonical contact id
+  const [emergencyContactUid, setEmergencyContactUid] = useState<string | null>(null);
 
-  // Settings popup control: store which mainUser is being edited
-  const [settingsUser, setSettingsUser] = useState<
-    { mainUserUid: string; emergencyContactUid: string } | null
-  >(null);
+  // centered popup when location is missing
+  const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(null);
 
-  const unsubsRef = useRef<Record<string, () => void>>({});
+  // keep all active unsubscribers here
+  const unsubsRef = useRef<Record<string, Unsubscribe>>({});
 
   useEffect(() => {
+    const LINKS_KEY = "links";
+
     const unsubAuth = onAuthStateChanged(auth, async (user) => {
+      // clean up any previous listeners
       Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
       setMainUsers([]);
-      setUid(null);
-      setSettingsUser(null);
+      setEmergencyContactUid(null);
 
       if (!user) {
         setLoading(false);
         router.replace(
-          `/login?role=emergency_contact&next=${encodeURIComponent(
-            "/emergency-dashboard"
-          )}`
+          `/login?role=emergency_contact&next=${encodeURIComponent("/emergency-dashboard")}`
         );
         return;
       }
 
+      // gate by role using your users/{uid}.role
       try {
         const meSnap = await getDoc(doc(db, "users", user.uid));
-        const myRole = normalizeRole(
-          meSnap.exists() ? (meSnap.data() as any).role : undefined
-        );
+        const myRole = normalizeRole(meSnap.exists() ? (meSnap.data() as any).role : undefined);
         if (myRole !== "emergency_contact") {
           router.replace("/dashboard");
           return;
         }
       } catch {
         router.replace(
-          `/login?role=emergency_contact&next=${encodeURIComponent(
-            "/emergency-dashboard"
-          )}`
+          `/login?role=emergency_contact&next=${encodeURIComponent("/emergency-dashboard")}`
         );
         return;
       }
 
-      setUid(user.uid);
+      setEmergencyContactUid(user.uid);
       setLoading(false);
 
-      const linksQuery = query(
+      // ✅ New canonical link query:
+      // users/{mainUserUid}/emergency_contact/{linkDoc} where emergencyContactUid == current user.uid
+      const linksByEmergencyContactUid = query(
         collectionGroup(db, "emergency_contact"),
-        where("uid", "==", user.uid)
+        where("emergencyContactUid", "==", user.uid)
       );
 
-      unsubsRef.current.links = onSnapshot(linksQuery, (linksSnap) => {
-        const nextMainUserIds = new Set<string>();
+      function wireLinksListener(q: FsQuery<DocumentData>, key: string) {
+        unsubsRef.current[key] = onSnapshot(q, (linksSnap: QuerySnapshot<DocumentData>) => {
+          // gather all main user IDs referenced by the link snapshot(s)
+          const nextMainUserIds = new Set<string>(
+            Object.keys(unsubsRef.current).filter((k) => k !== LINKS_KEY)
+          );
 
-        linksSnap.forEach((linkDoc) => {
-          // `linkDoc.ref.parent.parent` should be users/{mainUserId}/emergency_contact/{docId}
-          const mainUserUid = linkDoc.ref.parent.parent?.id;
-          if (mainUserUid) nextMainUserIds.add(mainUserUid);
-        });
+          linksSnap.forEach((linkDoc) => {
+            // users/{MAIN_UID}/emergency_contact/{...}
+            const mainUserUid = linkDoc.ref.parent.parent?.id;
+            if (mainUserUid) nextMainUserIds.add(mainUserUid);
+          });
 
-        // remove listeners for users that are no longer linked
-        Object.keys(unsubsRef.current).forEach((k) => {
-          if (k !== "links" && !nextMainUserIds.has(k)) {
-            unsubsRef.current[k]();
-            delete unsubsRef.current[k];
-          }
-        });
+          // remove listeners for unlinked users
+          Object.keys(unsubsRef.current).forEach((k) => {
+            if (k === LINKS_KEY) return;
+            if (!nextMainUserIds.has(k)) {
+              unsubsRef.current[k](); // unsubscribe
+              delete unsubsRef.current[k];
+            }
+          });
 
-        // add listeners for new linked users
-        nextMainUserIds.forEach((mainUserId) => {
-          if (unsubsRef.current[mainUserId]) return;
+          // ensure we are listening to each linked main user doc
+          nextMainUserIds.forEach((mainUserId) => {
+            if (unsubsRef.current[mainUserId]) return;
 
-          const userDocRef = doc(db, "users", mainUserId);
-          unsubsRef.current[mainUserId] = onSnapshot(
-            userDocRef,
-            (userDocSnap) => {
-              const userData = userDocSnap.data() as MainUserDoc;
-              let updatedCard: MainUserCard;
+            const userDocRef = doc(db, "users", mainUserId);
+            unsubsRef.current[mainUserId] = onSnapshot(
+              userDocRef,
+              (userDocSnap) => {
+                const userData = (userDocSnap.data() as MainUserDoc) || undefined;
 
-              if (userDocSnap.exists() && userData) {
                 const name =
-                  `${userData.firstName || ""} ${userData.lastName || ""}`.trim() ||
+                  `${userData?.firstName || ""} ${userData?.lastName || ""}`.trim() ||
                   "Main User";
-                const displayName = `${userData.firstName || ""} ${
-                  userData.lastName?.[0] || ""
+                const displayName = `${userData?.firstName || ""} ${
+                  userData?.lastName?.[0] || ""
                 }`.trim();
                 const { initials, colorClass } = initialsAndColor(name);
 
                 const last =
-                  userData.lastCheckinAt instanceof Timestamp
+                  userData?.lastCheckinAt instanceof Timestamp
                     ? userData.lastCheckinAt.toDate()
                     : undefined;
-                const rawInt = userData.checkinInterval;
+
+                const rawInt = userData?.checkinInterval;
                 const intervalMin =
-                  typeof rawInt === "number"
-                    ? rawInt
-                    : parseInt(String(rawInt), 10) || 12 * 60;
+                  typeof rawInt === "number" ? rawInt : parseInt(String(rawInt ?? ""), 10) || 12 * 60;
+
+                // ✅ prefer dueAtMin from backend if present
+                const dueAtMin = Number((userData as any)?.dueAtMin);
+                const nowMin = Math.floor(Date.now() / 60000);
 
                 let status: Status = "OK";
-                if (userData.sosTriggeredAt instanceof Timestamp) {
+                if (userData?.sosTriggeredAt instanceof Timestamp) {
                   status = "SOS";
+                } else if (Number.isFinite(dueAtMin)) {
+                  status = nowMin >= dueAtMin ? "Inactive" : "OK";
                 } else if (last) {
                   const nextDue = last.getTime() + intervalMin * 60 * 1000;
-                  if (Date.now() > nextDue) status = "Inactive";
+                  status = Date.now() > nextDue ? "Inactive" : "OK";
                 } else {
                   status = "Inactive";
                 }
 
-                updatedCard = {
+                const updatedCard: MainUserCard = {
                   mainUserUid: mainUserId,
-                  name: displayName,
-                  avatar: userData.avatar,
+                  name: displayName || name,
+                  avatar: userData?.avatar,
                   initials,
                   colorClass,
                   status,
                   lastCheckIn: formatWhen(last),
-                  location: userData.location || "",
+                  location: userData?.location || "",
                 };
-              } else {
-                const { initials, colorClass } = initialsAndColor("User Not Found");
-                updatedCard = {
-                  mainUserUid: mainUserId,
-                  name: "User Not Found",
-                  initials,
-                  colorClass,
-                  avatar: "",
-                  status: "Inactive",
-                };
-              }
 
-              setMainUsers((prev) => {
-                const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-                map.set(mainUserId, updatedCard);
-                return Array.from(map.values()).sort((a, b) =>
-                  a.name.localeCompare(b.name)
-                );
-              });
-            },
-            (error) => {
-              console.error(
-                `[Emergency Dashboard] User doc listen failed for ${mainUserId}:`,
-                error
-              );
-              const { initials, colorClass } = initialsAndColor("User Load Error");
-              setMainUsers((prev) => {
-                const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-                map.set(mainUserId, {
-                  mainUserUid: mainUserId,
-                  name: "User Load Error",
-                  initials,
-                  colorClass,
-                  status: "Inactive",
+                setMainUsers((prev) => {
+                  const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                  map.set(mainUserId, updatedCard);
+                  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
                 });
-                return Array.from(map.values()).sort((a, b) =>
-                  a.name.localeCompare(b.name)
-                );
-              });
-            }
-          );
-        });
+              },
+              (error) => {
+                console.error(`[Emergency Dashboard] User doc listen failed for ${mainUserId}:`, error);
+                const { initials, colorClass } = initialsAndColor("User Load Error");
+                setMainUsers((prev) => {
+                  const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                  map.set(mainUserId, {
+                    mainUserUid: mainUserId,
+                    name: "User Load Error",
+                    initials,
+                    colorClass,
+                    status: "Inactive",
+                  });
+                  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+                });
+              }
+            );
+          });
 
-        // filter out any users that are no longer in the links
-        setMainUsers((prev) => {
-          const validUids = new Set(nextMainUserIds);
-          return prev.filter((user) => validUids.has(user.mainUserUid));
+          // drop any cards that are no longer linked
+          setMainUsers((prev) => {
+            const valid = new Set(Object.keys(unsubsRef.current).filter((k) => k !== LINKS_KEY));
+            return prev.filter((u) => valid.has(u.mainUserUid));
+          });
         });
-      });
+      }
+
+      wireLinksListener(linksByEmergencyContactUid as FsQuery<DocumentData>, LINKS_KEY);
     });
 
     return () => {
+      // cleanup on unmount
       unsubAuth();
       Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
     };
   }, [router]);
 
+  // ensure this contact device is registered to receive pushes
   useEffect(() => {
-    if (!uid) return;
-    registerDevice(uid, "emergency");
-  }, [uid]);
+    if (!emergencyContactUid) return;
+    registerDevice(emergencyContactUid, "emergency"); // keep your signature
+  }, [emergencyContactUid]);
 
   const handleAcknowledge = (userName: string) => {
     toast({
@@ -355,9 +351,7 @@ export default function EmergencyDashboardPage() {
       setNoLocationUser(user);
       return;
     }
-    const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-      loc
-    )}`;
+    const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
     window.open(mapsUrl, "_blank", "noopener,noreferrer");
   };
 
@@ -365,15 +359,21 @@ export default function EmergencyDashboardPage() {
     <div className="flex flex-col min-h-screen bg-secondary">
       <Header />
       <main className="flex-grow container mx-auto px-4 py-8">
-        <h1 className="text-3xl md:text-4xl font-headline font-bold mb-6">
-          Emergency Contact Dashboard
-        </h1>
+        <div className="flex items-center justify-between mb-6">
+          <h1 className="text-3xl md:text-4xl font-headline font-bold">
+            Emergency Contact Dashboard
+          </h1>
+          {emergencyContactUid && (
+            <Button variant="outline" onClick={() => router.push("/emergency-settings")}>
+              <SettingsIcon className="h-5 w-5 mr-2" />
+              Settings
+            </Button>
+          )}
+        </div>
 
         {loading && <p>Loading your people…</p>}
         {!loading && mainUsers.length === 0 && (
-          <p className="opacity-70">
-            No linked users yet. Ask them to send you an invite.
-          </p>
+          <p className="opacity-70">No linked users yet. Ask them to send you an invite.</p>
         )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -386,47 +386,25 @@ export default function EmergencyDashboardPage() {
                   p.status === "SOS" ? "border-destructive bg-destructive/10" : ""
                 }`}
               >
-                <CardHeader className="flex flex-row items-center gap-4 justify-between">
-                  <div className="flex items-center gap-4">
-                    <Avatar className="h-16 w-16">
-                      <AvatarImage src={p.avatar || ""} alt={p.name} />
-                      <AvatarFallback className={`${p.colorClass} text-foreground`}>
-                        {p.initials}
-                      </AvatarFallback>
-                    </Avatar>
-                    <div>
-                      <CardTitle className="text-2xl font-headline">{p.name}</CardTitle>
-                      <CardDescription>
-                        {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
-                      </CardDescription>
-                    </div>
-                  </div>
-
-                  {/* Settings gear button (opens UserSettingsDialog modal) */}
+                <CardHeader className="flex flex-row items-center gap-4">
+                  <Avatar className="h-16 w-16">
+                    <AvatarImage src={p.avatar || ""} alt={p.name} />
+                    <AvatarFallback className={`${p.colorClass} text-foreground`}>
+                      {p.initials}
+                    </AvatarFallback>
+                  </Avatar>
                   <div>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() =>
-                        setSettingsUser({
-                          mainUserUid: p.mainUserUid,
-                          emergencyContactUid: uid || "", // logged-in emergency contact uid
-                        })
-                      }
-                      aria-label={`Settings for ${p.name}`}
-                    >
-                      <Settings className="h-5 w-5" />
-                    </Button>
+                    <CardTitle className="text-2xl font-headline">{p.name}</CardTitle>
+                    <CardDescription>
+                      {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
+                    </CardDescription>
                   </div>
                 </CardHeader>
 
                 <CardContent className="space-y-4">
                   <div className="flex justify-between items-center">
                     <p className="font-semibold">Status:</p>
-                    <Badge
-                      variant={getStatusVariant(p.status)}
-                      className="text-md px-3 py-1"
-                    >
+                    <Badge variant={getStatusVariant(p.status)} className="text-md px-3 py-1">
                       {p.status || "—"}
                     </Badge>
                   </div>
@@ -462,10 +440,7 @@ export default function EmergencyDashboardPage() {
                     Message
                   </Button>
                   {p.status === "SOS" && (
-                    <Button
-                      className="col-span-2"
-                      onClick={() => handleAcknowledge(p.name)}
-                    >
+                    <Button className="col-span-2" onClick={() => handleAcknowledge(p.name)}>
                       Acknowledge Alert
                     </Button>
                   )}
@@ -477,21 +452,8 @@ export default function EmergencyDashboardPage() {
       </main>
       <Footer />
 
-      {/* Settings dialog (controlled) */}
-      <UserSettingsDialog
-        mainUserUid={settingsUser?.mainUserUid || ""}
-        emergencyContactUid={settingsUser?.emergencyContactUid || ""}
-        open={!!settingsUser}
-        onOpenChange={(open) => {
-          if (!open) setSettingsUser(null);
-        }}
-      />
-
       {/* Centered popup when location is missing */}
-      <Dialog
-        open={!!noLocationUser}
-        onOpenChange={(open) => !open && setNoLocationUser(null)}
-      >
+      <Dialog open={!!noLocationUser} onOpenChange={(open) => !open && setNoLocationUser(null)}>
         <DialogContent className="sm:max-w-[420px]">
           <DialogHeader>
             <DialogTitle>Location unavailable</DialogTitle>
