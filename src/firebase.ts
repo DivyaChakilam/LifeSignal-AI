@@ -2,7 +2,6 @@
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
-import { getMessaging, isSupported } from "firebase/messaging";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -14,13 +13,21 @@ const firebaseConfig = {
   measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
-// Initialize Firebase
-const apps = getApps();
-const app = apps.length ? apps[0] : initializeApp(firebaseConfig);
+// Initialize app (server-safe)
+const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
 export const db = getFirestore(app);
+export const googleProvider = new GoogleAuthProvider();
 
-// Messaging is only available in secure origins + supported browsers
-export const messagingPromise = isSupported().then(s => (s ? getMessaging(app) : null));
+// Lazy-load Messaging for browser only
+export async function loadMessaging() {
+  if (typeof window === "undefined") return null;
+
+  const { getMessaging, isSupported } = await import("firebase/messaging");
+  const supported = await isSupported();
+  return supported ? getMessaging(app) : null;
+}
+
+// Backward-compatible export for old pages
+export const messagingPromise = loadMessaging();

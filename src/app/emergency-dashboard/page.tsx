@@ -35,7 +35,16 @@ import {
 } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { MapPin, Phone, MessageSquare, Settings as SettingsIcon } from "lucide-react";
+import {
+  MapPin,
+  Phone,
+  MessageSquare,
+  Settings as SettingsIcon,
+  ShieldAlert,
+  ShieldCheck,
+  Play,
+  Pause,
+} from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 // Centered popup dialog
@@ -50,6 +59,7 @@ import {
 // Push registration + roles
 import { registerDevice } from "@/lib/useFcmToken";
 import { normalizeRole } from "@/lib/roles";
+import { sanitizePhone } from "@/lib/phone";
 
 // ---------------------- Types ----------------------
 export type Status = "OK" | "Inactive" | "SOS";
@@ -62,7 +72,18 @@ export type MainUserCard = {
   status?: Status;
   lastCheckIn?: string;
   location?: string; // address or "lat,lng"
+  locationShareReason?: "sos" | "escalation" | null;
+  locationSharedAt?: Date | null;
+  locationSharing?: boolean;
   colorClass: string;
+  phone?: string | null;
+  latestVoiceMessage?: {
+    transcript: string;
+    explanation: string;
+    anomalyDetected: boolean;
+    createdAt: Date | null;
+    audioUrl?: string | null;
+  } | null;
 };
 
 export type MainUserDoc = {
@@ -73,8 +94,19 @@ export type MainUserDoc = {
   checkinInterval?: number | string;
   sosTriggeredAt?: Timestamp;
   location?: string; // address or "lat,lng"
+  locationShareReason?: "sos" | "escalation" | null;
+  locationSharedAt?: Timestamp;
+  locationSharing?: boolean;
   role?: string;
   dueAtMin?: number; // materialized next deadline (minutes since epoch)
+  phone?: string;
+  latestVoiceMessage?: {
+    transcript?: string;
+    explanation?: string;
+    anomalyDetected?: boolean;
+    createdAt?: Timestamp;
+    audioDataUrl?: string;
+  };
 };
 
 // ---------------------- Helpers ----------------------
@@ -165,6 +197,85 @@ export default function EmergencyDashboardPage() {
 
   // centered popup when location is missing
   const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(null);
+
+  // audio playback state for recorded voice messages
+  const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const [playingUid, setPlayingUid] = useState<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      Object.values(audioRefs.current).forEach((audio) => {
+        try {
+          audio?.pause();
+        } catch {}
+      });
+      audioRefs.current = {};
+    };
+  }, []);
+
+  const registerAudioRef = (uid: string) => (element: HTMLAudioElement | null) => {
+    const previous = audioRefs.current[uid];
+    if (previous && previous !== element) {
+      previous.onended = null;
+      previous.onpause = null;
+    }
+
+    if (element) {
+      element.onended = () => {
+        setPlayingUid((prev) => (prev === uid ? null : prev));
+        try {
+          element.currentTime = 0;
+        } catch {}
+      };
+      element.onpause = () => {
+        setPlayingUid((prev) => (prev === uid ? null : prev));
+      };
+      audioRefs.current[uid] = element;
+    } else {
+      delete audioRefs.current[uid];
+    }
+  };
+
+  async function handleToggleAudioPlayback(uid: string, displayName: string) {
+    const audioEl = audioRefs.current[uid];
+    if (!audioEl) {
+      toast({
+        title: "No recording available",
+        description: `${displayName} did not attach an audio clip with their last check-in.`,
+      });
+      return;
+    }
+
+    if (playingUid && playingUid !== uid) {
+      const current = audioRefs.current[playingUid];
+      try {
+        current?.pause();
+        if (current) current.currentTime = 0;
+      } catch {}
+    }
+
+    if (playingUid === uid && !audioEl.paused) {
+      audioEl.pause();
+      audioEl.currentTime = 0;
+      setPlayingUid(null);
+      return;
+    }
+
+    try {
+      audioEl.currentTime = 0;
+      await audioEl.play();
+      setPlayingUid(uid);
+    } catch (error) {
+      console.error(`[Emergency Dashboard] Playback failed for ${uid}:`, error);
+      setPlayingUid(null);
+      toast({
+        title: "Playback blocked",
+        description:
+          "Your browser could not start audio playback. Try pressing the play button again after interacting with the page.",
+        variant: "destructive",
+      });
+    }
+  }
 
   // keep all active unsubscribers here
   const unsubsRef = useRef<Record<string, Unsubscribe>>({});
@@ -277,6 +388,56 @@ export default function EmergencyDashboardPage() {
                   status = "Inactive";
                 }
 
+                const shareReason =
+                  userData?.locationShareReason === "sos" ||
+                  userData?.locationShareReason === "escalation"
+                    ? userData.locationShareReason
+                    : null;
+
+                const sharedAt =
+                  userData?.locationSharedAt instanceof Timestamp
+                    ? userData.locationSharedAt.toDate()
+                    : null;
+
+                const hasConsent =
+                  typeof userData?.locationSharing === "boolean"
+                    ? userData.locationSharing
+                    : undefined;
+
+                const locationString = shareReason ? userData?.location || "" : "";
+
+                const sanitizedPhone = sanitizePhone((userData as any)?.phone);
+
+                const rawVoice = (userData as any)?.latestVoiceMessage;
+                let latestVoiceMessage = rawVoice
+                  ? {
+                      transcript:
+                        typeof rawVoice?.transcript === "string" ? rawVoice.transcript : "",
+                      explanation:
+                        typeof rawVoice?.explanation === "string" ? rawVoice.explanation : "",
+                      anomalyDetected: Boolean(rawVoice?.anomalyDetected),
+                      createdAt:
+                        rawVoice?.createdAt instanceof Timestamp
+                          ? rawVoice.createdAt.toDate()
+                          : null,
+                      audioUrl:
+                        typeof rawVoice?.audioDataUrl === "string" && rawVoice.audioDataUrl.trim()
+                          ? rawVoice.audioDataUrl
+                          : typeof rawVoice?.audioUrl === "string" && rawVoice.audioUrl.trim()
+                          ? rawVoice.audioUrl
+                          : null,
+                    }
+                  : null;
+
+                if (
+                  latestVoiceMessage &&
+                  !latestVoiceMessage.transcript &&
+                  !latestVoiceMessage.explanation &&
+                  !latestVoiceMessage.audioUrl
+                ) {
+                  latestVoiceMessage = null;
+                }
+
                 const updatedCard: MainUserCard = {
                   mainUserUid: mainUserId,
                   name: displayName || name,
@@ -285,7 +446,12 @@ export default function EmergencyDashboardPage() {
                   colorClass,
                   status,
                   lastCheckIn: formatWhen(last),
-                  location: userData?.location || "",
+                  location: locationString,
+                  locationShareReason: shareReason,
+                  locationSharedAt: sharedAt,
+                  locationSharing: hasConsent,
+                  phone: sanitizedPhone || null,
+                  latestVoiceMessage,
                 };
 
                 setMainUsers((prev) => {
@@ -347,7 +513,7 @@ export default function EmergencyDashboardPage() {
   // Open Google Maps if we have a location; otherwise show centered popup.
   const handleViewOnMap = (user: MainUserCard) => {
     const loc = (user.location || "").trim();
-    if (!loc) {
+    if (!loc || !user.locationShareReason) {
       setNoLocationUser(user);
       return;
     }
@@ -409,6 +575,113 @@ export default function EmergencyDashboardPage() {
                     </Badge>
                   </div>
 
+                  <div className="flex justify-between items-center">
+                    <p className="font-semibold">Location status:</p>
+                    <Badge
+                      variant={
+                        p.locationShareReason
+                          ? "secondary"
+                          : p.locationSharing
+                          ? "outline"
+                          : "destructive"
+                      }
+                      className="text-md px-3 py-1"
+                    >
+                      {p.locationShareReason
+                        ? p.locationShareReason === "sos"
+                          ? "Shared for SOS"
+                          : "Shared during escalation"
+                        : p.locationSharing
+                        ? "Waiting for alert"
+                        : "Opted out"}
+                    </Badge>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    {p.locationShareReason
+                      ? `Shared ${
+                          p.locationShareReason === "sos"
+                            ? "for an SOS alert"
+                            : "during an escalation"
+                        }${p.locationSharedAt ? ` at ${formatWhen(p.locationSharedAt)}` : ""}.`
+                      : p.locationSharing
+                      ? "Location will appear here if they trigger SOS or an escalation."
+                      : "They have not granted location sharing, so no location is available."}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {p.phone
+                      ? `Call button dials ${p.phone}.`
+                      : "They haven't added a phone number yet."}
+                  </p>
+
+                  {p.latestVoiceMessage && (
+                    <div
+                      className={`space-y-2 rounded-md border p-3 ${
+                        p.latestVoiceMessage.anomalyDetected
+                          ? "border-destructive/40 bg-destructive/10"
+                          : "border-green-500/40 bg-green-500/10"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-center gap-2 text-sm font-semibold">
+                          {p.latestVoiceMessage.anomalyDetected ? (
+                            <ShieldAlert className="h-4 w-4 text-destructive" aria-hidden />
+                          ) : (
+                            <ShieldCheck className="h-4 w-4 text-green-600" aria-hidden />
+                          )}
+                          <span>Latest voice update</span>
+                        </div>
+                        {p.latestVoiceMessage.createdAt && (
+                          <span className="text-xs text-muted-foreground whitespace-nowrap">
+                            {formatWhen(p.latestVoiceMessage.createdAt)}
+                          </span>
+                        )}
+                      </div>
+                      {p.latestVoiceMessage.transcript && (
+                        <p className="text-sm italic text-muted-foreground">
+                          “{p.latestVoiceMessage.transcript}”
+                        </p>
+                      )}
+                      {p.latestVoiceMessage.explanation && (
+                        <p className="text-sm leading-relaxed">
+                          {p.latestVoiceMessage.explanation}
+                        </p>
+                      )}
+                      {p.latestVoiceMessage.audioUrl && (
+                        <div className="flex flex-wrap items-center gap-3 pt-1">
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => handleToggleAudioPlayback(p.mainUserUid, p.name)}
+                            aria-label={
+                              playingUid === p.mainUserUid
+                                ? `Stop ${p.name}'s voice message`
+                                : `Play ${p.name}'s voice message`
+                            }
+                          >
+                            {playingUid === p.mainUserUid ? (
+                              <Pause className="mr-2 h-4 w-4" aria-hidden />
+                            ) : (
+                              <Play className="mr-2 h-4 w-4" aria-hidden />
+                            )}
+                            {playingUid === p.mainUserUid ? "Stop message" : "Play message"}
+                          </Button>
+                          <span className="text-xs text-muted-foreground">
+                            {playingUid === p.mainUserUid
+                              ? "Playing the original recording…"
+                              : "Hear the original voice message."}
+                          </span>
+                          <audio
+                            ref={registerAudioRef(p.mainUserUid)}
+                            src={p.latestVoiceMessage.audioUrl ?? undefined}
+                            preload="metadata"
+                            className="hidden"
+                            aria-hidden="true"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="relative h-40 w-full rounded-lg overflow-hidden border">
                     <Image
                       src={map.src}
@@ -422,19 +695,36 @@ export default function EmergencyDashboardPage() {
                         variant="secondary"
                         onClick={() => handleViewOnMap(p)}
                         aria-label={`View ${p.name} on map`}
+                        disabled={!p.locationShareReason || !(p.location || "").trim()}
                       >
                         <MapPin className="mr-2 h-4 w-4" />
                         View on Map
                       </Button>
+                      {!p.locationShareReason && (
+                        <p className="absolute bottom-3 left-3 right-3 text-center text-xs text-white">
+                          {p.locationSharing
+                            ? "Location becomes available here when an alert is active."
+                            : "This user opted out of location sharing."}
+                        </p>
+                      )}
                     </div>
                   </div>
                 </CardContent>
 
                 <CardFooter className="grid grid-cols-2 gap-2">
-                  <Button variant="outline">
-                    <Phone className="mr-2 h-4 w-4" />
-                    Call
-                  </Button>
+                  {p.phone ? (
+                    <Button asChild variant="outline">
+                      <a href={`tel:${p.phone}`} aria-label={`Call ${p.name}`}>
+                        <Phone className="mr-2 h-4 w-4" />
+                        Call
+                      </a>
+                    </Button>
+                  ) : (
+                    <Button variant="outline" disabled title="No phone number on file">
+                      <Phone className="mr-2 h-4 w-4" />
+                      Call
+                    </Button>
+                  )}
                   <Button variant="outline">
                     <MessageSquare className="mr-2 h-4 w-4" />
                     Message
@@ -459,7 +749,7 @@ export default function EmergencyDashboardPage() {
             <DialogTitle>Location unavailable</DialogTitle>
             <DialogDescription>
               {noLocationUser
-                ? `${noLocationUser.name} disabled location sharing or hasn’t shared a location yet.`
+                ? `${noLocationUser.name} has not shared a location right now. Locations only appear during an active SOS or escalation when they have opted in.`
                 : ""}
             </DialogDescription>
           </DialogHeader>

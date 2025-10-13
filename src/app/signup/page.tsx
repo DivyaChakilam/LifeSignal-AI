@@ -1,7 +1,7 @@
 // app/signup/page.tsx
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
@@ -40,6 +40,7 @@ import {
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 
 import { normalizeRole, type Role } from "@/lib/roles";
+import { isValidE164Phone, sanitizePhone } from "@/lib/phone";
 
 /* ---------------- Password policy (unchanged from your version) ---------------- */
 const passwordValidation = z
@@ -55,6 +56,12 @@ const signupSchema = z
     firstName: z.string().min(2, { message: "First name must be at least 2 characters." }),
     lastName: z.string().min(2, { message: "Last name must be at least 2 characters." }),
     email: z.string().email({ message: "Please enter a valid email." }),
+    phone: z
+      .string()
+      .min(1, { message: "Phone number is required." })
+      .refine((value) => isValidE164Phone(value), {
+        message: "Enter a valid phone number like +15551234567.",
+      }),
     password: passwordValidation,
     confirmPassword: z.string(),
   })
@@ -91,6 +98,14 @@ async function maybeAutoAcceptInvite(token: string | null) {
 }
 
 export default function SignupPage() {
+  return (
+    <Suspense>
+      <SignupPageContent />
+    </Suspense>
+  );
+}
+
+function SignupPageContent() {
   const router = useRouter();
   const params = useSearchParams();
   const { toast } = useToast();
@@ -130,6 +145,7 @@ export default function SignupPage() {
       firstName: "",
       lastName: "",
       email: "",
+      phone: "",
       password: "",
       confirmPassword: "",
     },
@@ -153,6 +169,8 @@ export default function SignupPage() {
     try {
       setIsSubmitting(true);
 
+      const sanitizedPhone = sanitizePhone(values.phone);
+
       // 1) Create Firebase user
       const cred = await createUserWithEmailAndPassword(
         auth,
@@ -168,11 +186,12 @@ export default function SignupPage() {
       await setDoc(
         doc(db, "users", cred.user.uid),
         {
-          uid: cred.user.uid,
+          mainUserUid: cred.user.uid,
           firstName: values.firstName,
           lastName: values.lastName,
           role,
           email: cred.user.email ?? values.email.trim().toLowerCase(),
+          phone: sanitizedPhone,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         },
@@ -269,6 +288,28 @@ export default function SignupPage() {
                       <FormControl>
                         <Input type="email" placeholder="you@example.com" {...field} disabled={isSubmitting} />
                       </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                {/* Phone */}
+                <FormField
+                  control={form.control}
+                  name="phone"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Mobile Phone</FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder="+15551234567"
+                          {...field}
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <p className="text-xs text-muted-foreground">
+                        Used when your emergency contacts tap “Call”. Include country code.
+                      </p>
                       <FormMessage />
                     </FormItem>
                   )}
