@@ -141,9 +141,9 @@ export async function POST(req: NextRequest) {
 
     /**
      * Create a NEW invite doc.
-     * We write BOTH mainUserUid (canonical) and mainUserUid (legacy) so that
+     * We write BOTH mainUserUid (canonical) and mainUserId (legacy) so that
      * older readers that still expect "mainUserId" keep working.
-     * Once everything reads "mainUserUid", you can drop mainUserUid.
+     * Once everything reads "mainUserUid", you can drop mainUserId.
      */
     const inviteRef = db.collection("invites").doc();
     batch.set(inviteRef, {
@@ -206,7 +206,7 @@ export async function POST(req: NextRequest) {
           <p>Hello${name ? " " + name : ""},</p>
           <p>You’ve been invited to be an <strong>emergency contact</strong>.</p>
           <p><a href="${acceptUrl}">Accept invitation</a> (link expires in 7 days).</p>
-          <p>If the link doesn\'t work, copy this URL:<br>${acceptUrl}</p>
+          <p>If the link doesn't work, copy this URL:<br>${acceptUrl}</p>
         `,
       },
     });
@@ -225,10 +225,24 @@ export async function POST(req: NextRequest) {
     if (e?.message === "UNAUTHENTICATED") {
       return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
     }
+    if (e?.message === "UNAUTHENTICATED") {
+      return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
+    }
     if (e?.message === "NOT_AUTHORIZED") {
       return NextResponse.json({ error: "Not authorized" }, { status: 403 });
     }
-    console.error(e);
+    console.error("Invite error:", e);
     return NextResponse.json({ error: e?.message ?? "Invite failed" }, { status: 400 });
   }
+}
+
+/**
+ * ✅ Required for Next.js App Router
+ * This ensures the route is properly registered and responds with JSON.
+ */
+export default async function handler(req: NextRequest) {
+  if (req.method === "POST") {
+    return await POST(req);
+  }
+  return NextResponse.json({ error: "Method not allowed" }, { status: 405 });
 }
