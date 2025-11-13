@@ -1,0 +1,3 @@
+# .eslintignore (at /studio root)
+functions/lib/
+functions/generated/

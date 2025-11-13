@@ -46,3 +46,8 @@ firestore-debug.log
 .env.local
 serviceAccountKey.json
 
+# Firebase local & build files
+.firebase/
+functions/lib/
+functions/node_modules/
+storage_export/
