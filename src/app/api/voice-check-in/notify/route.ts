@@ -212,7 +212,7 @@ export async function POST(req: NextRequest) {
     const voiceMessageRef = db
       .collection("users")
       .doc(mainUserUid)
-      .collection("voiceMessages")
+      .collection("voiceCheckin")
       .doc("latest");
 
     const sharedVoicePayload = {

@@ -1,4 +1,4 @@
-//src/app/emergency-dashboard/page.tsx/
+// src/app/emergency-dashboard/page.tsx
 "use client";
 
 import Image from "next/image";
@@ -44,6 +44,7 @@ import {
   ShieldCheck,
   Play,
   Pause,
+  Smile,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
@@ -56,12 +57,14 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 
+import { VoiceCheckIn } from "@/components/voice-check-in";
+
 // Push registration + roles
 import { registerDevice } from "@/lib/useFcmToken";
 import { normalizeRole } from "@/lib/roles";
 import { sanitizePhone } from "@/lib/phone";
 
-// ---------------------- Types ----------------------
+/* ---------------------- Types ---------------------- */
 export type Status = "OK" | "Inactive" | "SOS";
 
 export type MainUserCard = {
@@ -83,6 +86,12 @@ export type MainUserCard = {
     anomalyDetected: boolean;
     createdAt: Date | null;
     audioUrl?: string | null;
+  } | null;
+  // NEW: mood summary shown on the emergency dashboard
+  moodSummary?: {
+    mood: string;
+    description?: string;
+    updatedAt: Date | null;
   } | null;
 };
 
@@ -108,9 +117,16 @@ export type MainUserDoc = {
     audioDataUrl?: string;
     audioUrl?: string;
   };
+  // NEW: persisted mood summary written by /api/ask-ai
+  latestMoodAssessment?: {
+    mood?: string;
+    description?: string;
+    updatedAt?: Timestamp;
+    source?: "ask-ai";
+  };
 };
 
-// ---------------------- Helpers ----------------------
+/* ---------------------- Helpers ---------------------- */
 const userColors = [
   "bg-red-200",
   "bg-blue-200",
@@ -130,7 +146,8 @@ function initialsAndColor(name = "") {
       .toUpperCase() || "UA";
 
   const colorIndex =
-    name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) % userColors.length;
+    name.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0) %
+    userColors.length;
 
   return { initials, colorClass: userColors[colorIndex] };
 }
@@ -185,7 +202,7 @@ function getMapImage(location?: string) {
   return { src: url, alt: `Map of ${location}` } as const;
 }
 
-// ---------------------- Page ----------------------
+/* ---------------------- Page ---------------------- */
 export default function EmergencyDashboardPage() {
   const router = useRouter();
   const { toast } = useToast();
@@ -193,11 +210,28 @@ export default function EmergencyDashboardPage() {
   const [mainUsers, setMainUsers] = useState<MainUserCard[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // ✅ canonical contact id
-  const [emergencyContactUid, setEmergencyContactUid] = useState<string | null>(null);
+  // Canonical contact id
+  const [emergencyContactUid, setEmergencyContactUid] = useState<string | null>(
+    null,
+  );
 
   // centered popup when location is missing
-  const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(null);
+  const [noLocationUser, setNoLocationUser] = useState<MainUserCard | null>(
+    null,
+  );
+
+  // voice message modal target (EC → MainUser)
+  const [voiceModalOpen, setVoiceModalOpen] = useState(false);
+  const [voiceTargetMainUser, setVoiceTargetMainUser] = useState<null | {
+    uid: string;
+    name: string;
+    phone?: string | null;
+  }>(null);
+
+  const handleVoiceToMainDone = () => {
+    setVoiceTargetMainUser(null);
+    setVoiceModalOpen(false);
+  };
 
   // audio playback state for recorded voice messages
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
@@ -214,28 +248,29 @@ export default function EmergencyDashboardPage() {
     };
   }, []);
 
-  const registerAudioRef = (uid: string) => (element: HTMLAudioElement | null) => {
-    const previous = audioRefs.current[uid];
-    if (previous && previous !== element) {
-      previous.onended = null;
-      previous.onpause = null;
-    }
+  const registerAudioRef =
+    (uid: string) => (element: HTMLAudioElement | null) => {
+      const previous = audioRefs.current[uid];
+      if (previous && previous !== element) {
+        previous.onended = null;
+        previous.onpause = null;
+      }
 
-    if (element) {
-      element.onended = () => {
-        setPlayingUid((prev) => (prev === uid ? null : prev));
-        try {
-          element.currentTime = 0;
-        } catch {}
-      };
-      element.onpause = () => {
-        setPlayingUid((prev) => (prev === uid ? null : prev));
-      };
-      audioRefs.current[uid] = element;
-    } else {
-      delete audioRefs.current[uid];
-    }
-  };
+      if (element) {
+        element.onended = () => {
+          setPlayingUid((prev) => (prev === uid ? null : prev));
+          try {
+            element.currentTime = 0;
+          } catch {}
+        };
+        element.onpause = () => {
+          setPlayingUid((prev) => (prev === uid ? null : prev));
+        };
+        audioRefs.current[uid] = element;
+      } else {
+        delete audioRefs.current[uid];
+      }
+    };
 
   async function handleToggleAudioPlayback(uid: string, displayName: string) {
     const audioEl = audioRefs.current[uid];
@@ -281,6 +316,18 @@ export default function EmergencyDashboardPage() {
   // keep all active unsubscribers here
   const unsubsRef = useRef<Record<string, Unsubscribe>>({});
 
+  // NEW: keep per-link data (the per-contact lastVoiceMessage)
+  const linkStateRef = useRef<
+    Record<
+      string,
+      {
+        lastVoiceMessage?: any | null;
+        mainUserName?: string | null;
+        mainUserAvatar?: string | null;
+      }
+    >
+  >({});
+
   useEffect(() => {
     const LINKS_KEY = "links";
 
@@ -288,13 +335,16 @@ export default function EmergencyDashboardPage() {
       // clean up any previous listeners
       Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
+      linkStateRef.current = {};
       setMainUsers([]);
       setEmergencyContactUid(null);
 
       if (!user) {
         setLoading(false);
         router.replace(
-          `/login?role=emergency_contact&next=${encodeURIComponent("/emergency-dashboard")}`
+          `/login?role=emergency_contact&next=${encodeURIComponent(
+            "/emergency-dashboard",
+          )}`,
         );
         return;
       }
@@ -302,14 +352,18 @@ export default function EmergencyDashboardPage() {
       // gate by role using your users/{uid}.role
       try {
         const meSnap = await getDoc(doc(db, "users", user.uid));
-        const myRole = normalizeRole(meSnap.exists() ? (meSnap.data() as any).role : undefined);
+        const myRole = normalizeRole(
+          meSnap.exists() ? (meSnap.data() as any).role : undefined,
+        );
         if (myRole !== "emergency_contact") {
           router.replace("/dashboard");
           return;
         }
       } catch {
         router.replace(
-          `/login?role=emergency_contact&next=${encodeURIComponent("/emergency-dashboard")}`
+          `/login?role=emergency_contact&next=${encodeURIComponent(
+            "/emergency-dashboard",
+          )}`,
         );
         return;
       }
@@ -317,177 +371,354 @@ export default function EmergencyDashboardPage() {
       setEmergencyContactUid(user.uid);
       setLoading(false);
 
-      // ✅ New canonical link query:
       // users/{mainUserUid}/emergency_contact/{linkDoc} where emergencyContactUid == current user.uid
       const linksByEmergencyContactUid = query(
         collectionGroup(db, "emergency_contact"),
-        where("emergencyContactUid", "==", user.uid)
+        where("emergencyContactUid", "==", user.uid),
       );
 
       function wireLinksListener(q: FsQuery<DocumentData>, key: string) {
-        unsubsRef.current[key] = onSnapshot(q, (linksSnap: QuerySnapshot<DocumentData>) => {
-          // gather all main user IDs referenced by the link snapshot(s)
-          const nextMainUserIds = new Set<string>(
-            Object.keys(unsubsRef.current).filter((k) => k !== LINKS_KEY)
-          );
+        unsubsRef.current[key] = onSnapshot(
+          q,
+          (linksSnap: QuerySnapshot<DocumentData>) => {
+            // gather all main user IDs referenced by the link snapshot(s)
+            const nextMainUserIds = new Set<string>(
+              Object.keys(unsubsRef.current)
+                .filter((k) => k !== LINKS_KEY && !k.startsWith("link:")),
+            );
 
-          linksSnap.forEach((linkDoc) => {
-            // users/{MAIN_UID}/emergency_contact/{...}
-            const mainUserUid = linkDoc.ref.parent.parent?.id;
-            if (mainUserUid) nextMainUserIds.add(mainUserUid);
-          });
+            // track all link keys we still need after this tick
+            const liveLinkKeys = new Set<string>();
 
-          // remove listeners for unlinked users
-          Object.keys(unsubsRef.current).forEach((k) => {
-            if (k === LINKS_KEY) return;
-            if (!nextMainUserIds.has(k)) {
-              unsubsRef.current[k](); // unsubscribe
-              delete unsubsRef.current[k];
-            }
-          });
+            linksSnap.forEach((linkDoc) => {
+              // users/{MAIN_UID}/emergency_contact/{...}
+              const mainUserUid = linkDoc.ref.parent.parent?.id;
+              if (!mainUserUid) return;
 
-          // ensure we are listening to each linked main user doc
-          nextMainUserIds.forEach((mainUserId) => {
-            if (unsubsRef.current[mainUserId]) return;
+              const linkData = linkDoc.data() as any;
+              const linkName =
+                typeof linkData?.mainUserName === "string"
+                  ? linkData.mainUserName.trim()
+                  : "";
+              const linkAvatar =
+                typeof linkData?.mainUserAvatar === "string"
+                  ? linkData.mainUserAvatar.trim()
+                  : "";
 
-            const userDocRef = doc(db, "users", mainUserId);
-            unsubsRef.current[mainUserId] = onSnapshot(
-              userDocRef,
-              (userDocSnap) => {
-                const userData = (userDocSnap.data() as MainUserDoc) || undefined;
+              const existingLinkState = linkStateRef.current[mainUserUid] ?? {};
+              linkStateRef.current[mainUserUid] = {
+                ...existingLinkState,
+                mainUserName: linkName || existingLinkState.mainUserName || null,
+                mainUserAvatar: linkAvatar || existingLinkState.mainUserAvatar || null,
+              };
 
-                const name =
-                  `${userData?.firstName || ""} ${userData?.lastName || ""}`.trim() ||
-                  "Main User";
-                const displayName = `${userData?.firstName || ""} ${
-                  userData?.lastName?.[0] || ""
-                }`.trim();
-                const { initials, colorClass } = initialsAndColor(name);
+              nextMainUserIds.add(mainUserUid);
 
-                const last =
-                  userData?.lastCheckinAt instanceof Timestamp
-                    ? userData.lastCheckinAt.toDate()
-                    : undefined;
+              // set up a per-link listener so we can read lastVoiceMessage
+              const linkKey = `link:${mainUserUid}`;
+              liveLinkKeys.add(linkKey);
 
-                const rawInt = userData?.checkinInterval;
-                const intervalMin =
-                  typeof rawInt === "number" ? rawInt : parseInt(String(rawInt ?? ""), 10) || 12 * 60;
-
-                // ✅ prefer dueAtMin from backend if present
-                const dueAtMin = Number((userData as any)?.dueAtMin);
-                const nowMin = Math.floor(Date.now() / 60000);
-
-                let status: Status = "OK";
-                if (userData?.sosTriggeredAt instanceof Timestamp) {
-                  status = "SOS";
-                } else if (Number.isFinite(dueAtMin)) {
-                  status = nowMin >= dueAtMin ? "Inactive" : "OK";
-                } else if (last) {
-                  const nextDue = last.getTime() + intervalMin * 60 * 1000;
-                  status = Date.now() > nextDue ? "Inactive" : "OK";
-                } else {
-                  status = "Inactive";
-                }
-
-                const shareReason =
-                  userData?.locationShareReason === "sos" ||
-                  userData?.locationShareReason === "escalation"
-                    ? userData.locationShareReason
-                    : null;
-
-                const sharedAt =
-                  userData?.locationSharedAt instanceof Timestamp
-                    ? userData.locationSharedAt.toDate()
-                    : null;
-
-                const hasConsent =
-                  typeof userData?.locationSharing === "boolean"
-                    ? userData.locationSharing
-                    : undefined;
-
-                const locationString = shareReason ? userData?.location || "" : "";
-
-                const sanitizedPhone = sanitizePhone((userData as any)?.phone);
-
-                const rawVoice = (userData as any)?.latestVoiceMessage;
-                let latestVoiceMessage = rawVoice
-                  ? {
-                      transcript:
-                        typeof rawVoice?.transcript === "string" ? rawVoice.transcript : "",
-                      explanation:
-                        typeof rawVoice?.explanation === "string" ? rawVoice.explanation : "",
-                      anomalyDetected: Boolean(rawVoice?.anomalyDetected),
-                      createdAt:
-                        rawVoice?.createdAt instanceof Timestamp
-                          ? rawVoice.createdAt.toDate()
-                          : null,
-                      audioUrl:
-                        typeof rawVoice?.audioDataUrl === "string" && rawVoice.audioDataUrl.trim()
-                          ? rawVoice.audioDataUrl
-                          : typeof rawVoice?.audioUrl === "string" && rawVoice.audioUrl.trim()
-                          ? rawVoice.audioUrl
-                          : null,
-                    }
-                  : null;
-
-                if (
-                  latestVoiceMessage &&
-                  !latestVoiceMessage.transcript &&
-                  !latestVoiceMessage.explanation &&
-                  !latestVoiceMessage.audioUrl
-                ) {
-                  latestVoiceMessage = null;
-                }
-
-                const updatedCard: MainUserCard = {
-                  mainUserUid: mainUserId,
-                  name: displayName || name,
-                  avatar: userData?.avatar,
-                  initials,
-                  colorClass,
-                  status,
-                  lastCheckIn: formatWhen(last),
-                  location: locationString,
-                  locationShareReason: shareReason,
-                  locationSharedAt: sharedAt,
-                  locationSharing: hasConsent,
-                  phone: sanitizedPhone || null,
-                  latestVoiceMessage,
-                };
-
-                setMainUsers((prev) => {
-                  const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-                  map.set(mainUserId, updatedCard);
-                  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-                });
-              },
-              (error) => {
-                console.error(`[Emergency Dashboard] User doc listen failed for ${mainUserId}:`, error);
-                const { initials, colorClass } = initialsAndColor("User Load Error");
-                setMainUsers((prev) => {
-                  const map = new Map(prev.map((u) => [u.mainUserUid, u]));
-                  map.set(mainUserId, {
-                    mainUserUid: mainUserId,
-                    name: "User Load Error",
-                    initials,
-                    colorClass,
-                    status: "Inactive",
-                  } as MainUserCard);
-                  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+              if (!unsubsRef.current[linkKey]) {
+                unsubsRef.current[linkKey] = onSnapshot(linkDoc.ref, (s) => {
+                  const d = s.data() as any;
+                  linkStateRef.current[mainUserUid] = {
+                    lastVoiceMessage: d?.lastVoiceMessage ?? null,
+                    mainUserName:
+                      typeof d?.mainUserName === "string"
+                        ? d.mainUserName.trim() || null
+                        : linkName || null,
+                    mainUserAvatar:
+                      typeof d?.mainUserAvatar === "string"
+                        ? d.mainUserAvatar.trim() || null
+                        : linkAvatar || null,
+                  };
+                  // trigger refresh of the card that uses this mainUserUid
+                  setMainUsers((prev) =>
+                    prev.map((u) => {
+                      if (u.mainUserUid !== mainUserUid) return u;
+                      const state = linkStateRef.current[mainUserUid];
+                      const fallbackName = state?.mainUserName || u.name;
+                      const fallbackAvatar = state?.mainUserAvatar || u.avatar;
+                      return { ...u, name: fallbackName, avatar: fallbackAvatar || undefined };
+                    }),
+                  );
                 });
               }
-            );
-          });
 
-          // drop any cards that are no longer linked
-          setMainUsers((prev) => {
-            const valid = new Set(Object.keys(unsubsRef.current).filter((k) => k !== LINKS_KEY));
-            return prev.filter((u) => valid.has(u.mainUserUid));
-          });
-        });
+              // If we do not yet have a card for this main user, seed one from the link data
+              setMainUsers((prev) => {
+                if (prev.some((u) => u.mainUserUid === mainUserUid)) return prev;
+
+                const baseName = linkName || "Linked main user";
+                const { initials, colorClass } = initialsAndColor(baseName);
+
+                const seeded: MainUserCard = {
+                  mainUserUid,
+                  name: baseName,
+                  avatar: linkAvatar || undefined,
+                  initials,
+                  colorClass,
+                  status: "Inactive",
+                  lastCheckIn: "—",
+                  location: "",
+                  locationShareReason: null,
+                  locationSharedAt: null,
+                };
+
+                return [...prev, seeded].sort((a, b) =>
+                  a.name.localeCompare(b.name),
+                );
+              });
+            });
+
+            // remove listeners for unlinked users (user doc listeners)
+            Object.keys(unsubsRef.current).forEach((k) => {
+              if (k === LINKS_KEY) return;
+              if (k.startsWith("link:")) return; // handled below
+              if (!nextMainUserIds.has(k)) {
+                unsubsRef.current[k](); // unsubscribe
+                delete unsubsRef.current[k];
+              }
+            });
+
+            // remove link listeners whose main user is no longer present
+            Object.keys(unsubsRef.current).forEach((k) => {
+              if (!k.startsWith("link:")) return;
+              if (!liveLinkKeys.has(k)) {
+                unsubsRef.current[k]();
+                delete unsubsRef.current[k];
+                const id = k.slice(5);
+                delete linkStateRef.current[id];
+              }
+            });
+
+            // ensure we are listening to each linked main user doc
+            nextMainUserIds.forEach((mainUserId) => {
+              if (
+                unsubsRef.current[mainUserId] &&
+                typeof unsubsRef.current[mainUserId] === "function"
+              )
+                return;
+
+              const userDocRef = doc(db, "users", mainUserId);
+              unsubsRef.current[mainUserId] = onSnapshot(
+                userDocRef,
+                (userDocSnap) => {
+                  const userData =
+                    (userDocSnap.data() as MainUserDoc) || undefined;
+
+                  const linkState = linkStateRef.current[mainUserId];
+                  const linkName =
+                    typeof linkState?.mainUserName === "string"
+                      ? linkState.mainUserName
+                      : null;
+                  const linkAvatar =
+                    typeof linkState?.mainUserAvatar === "string"
+                      ? linkState.mainUserAvatar
+                      : null;
+
+                  const rawFullName = `${userData?.firstName || ""} ${
+                    userData?.lastName || ""
+                  }`.trim();
+                  const resolvedFullName = rawFullName || linkName || "Main User";
+                  const displayName = rawFullName
+                    ? `${userData?.firstName || ""} ${
+                        userData?.lastName?.[0] || ""
+                      }`.trim()
+                    : linkName || resolvedFullName;
+                  const { initials, colorClass } = initialsAndColor(resolvedFullName);
+
+                  const last =
+                    userData?.lastCheckinAt instanceof Timestamp
+                      ? userData.lastCheckinAt.toDate()
+                      : undefined;
+
+                  const rawInt = userData?.checkinInterval;
+                  const intervalMin =
+                    typeof rawInt === "number"
+                      ? rawInt
+                      : parseInt(String(rawInt ?? ""), 10) || 12 * 60;
+
+                  // prefer dueAtMin from backend if present
+                  const dueAtMin = Number((userData as any)?.dueAtMin);
+                  const nowMin = Math.floor(Date.now() / 60000);
+
+                  let status: Status = "OK";
+                  if (userData?.sosTriggeredAt instanceof Timestamp) {
+                    status = "SOS";
+                  } else if (Number.isFinite(dueAtMin)) {
+                    status = nowMin >= dueAtMin ? "Inactive" : "OK";
+                  } else if (last) {
+                    const nextDue = last.getTime() + intervalMin * 60 * 1000;
+                    status = Date.now() > nextDue ? "Inactive" : "OK";
+                  } else {
+                    status = "Inactive";
+                  }
+
+                  const shareReason =
+                    userData?.locationShareReason === "sos" ||
+                    userData?.locationShareReason === "escalation"
+                      ? userData.locationShareReason
+                      : null;
+
+                  const sharedAt =
+                    userData?.locationSharedAt instanceof Timestamp
+                      ? userData.locationSharedAt.toDate()
+                      : null;
+
+                  const hasConsent =
+                    typeof userData?.locationSharing === "boolean"
+                      ? userData.locationSharing
+                      : undefined;
+
+                  const locationString = shareReason
+                    ? userData?.location || ""
+                    : "";
+
+                  const sanitizedPhone = sanitizePhone(
+                    (userData as any)?.phone,
+                  );
+
+                  // Prefer the per-contact (link) message; fall back to global latest
+                  const linkVmRaw =
+                    linkStateRef.current[mainUserId]?.lastVoiceMessage;
+                  const sourceVm = linkVmRaw ?? (userData as any)?.latestVoiceMessage;
+
+                  let latestVoiceMessage = sourceVm
+                    ? {
+                        transcript:
+                          typeof sourceVm?.transcript === "string"
+                            ? sourceVm.transcript
+                            : "",
+                        explanation:
+                          typeof sourceVm?.explanation === "string"
+                            ? sourceVm.explanation
+                            : "",
+                        anomalyDetected: Boolean(sourceVm?.anomalyDetected),
+                        createdAt:
+                          sourceVm?.createdAt &&
+                          typeof sourceVm.createdAt.toDate === "function"
+                            ? sourceVm.createdAt.toDate()
+                            : null,
+                        audioUrl:
+                          typeof sourceVm?.audioDataUrl === "string" &&
+                          sourceVm.audioDataUrl.trim()
+                            ? sourceVm.audioDataUrl
+                            : typeof sourceVm?.audioUrl === "string" &&
+                              sourceVm.audioUrl.trim()
+                            ? sourceVm.audioUrl
+                            : null,
+                      }
+                    : null;
+
+                  if (
+                    latestVoiceMessage &&
+                    !latestVoiceMessage.transcript &&
+                    !latestVoiceMessage.explanation &&
+                    !latestVoiceMessage.audioUrl
+                  ) {
+                    latestVoiceMessage = null;
+                  }
+
+                  // ---- Mood summary (from /api/ask-ai) ----
+                  const rawMood = (userData as any)?.latestMoodAssessment;
+                  const moodSummary =
+                    rawMood &&
+                    typeof rawMood?.mood === "string" &&
+                    rawMood.mood.trim()
+                      ? {
+                          mood: rawMood.mood.trim(),
+                          description:
+                            typeof rawMood?.description === "string"
+                              ? rawMood.description.trim()
+                              : undefined,
+                          updatedAt:
+                            rawMood?.updatedAt &&
+                            typeof rawMood.updatedAt.toDate === "function"
+                              ? rawMood.updatedAt.toDate()
+                              : null,
+                        }
+                      : null;
+
+                  const updatedCard: MainUserCard = {
+                    mainUserUid: mainUserId,
+                    name: displayName || resolvedFullName,
+                    avatar:
+                      (typeof userData?.avatar === "string" &&
+                        userData.avatar.trim()) ||
+                      linkAvatar ||
+                      undefined,
+                    initials,
+                    colorClass,
+                    status,
+                    lastCheckIn: formatWhen(last),
+                    location: locationString,
+                    locationShareReason: shareReason,
+                    locationSharedAt: sharedAt,
+                    locationSharing: hasConsent,
+                    phone: sanitizedPhone || null,
+                    latestVoiceMessage,
+                    moodSummary,
+                  };
+
+                  setMainUsers((prev) => {
+                    const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                    map.set(mainUserId, updatedCard);
+                    return Array.from(map.values()).sort((a, b) =>
+                      a.name.localeCompare(b.name),
+                    );
+                  });
+                },
+                (error) => {
+                  console.error(
+                    `[Emergency Dashboard] User doc listen failed for ${mainUserId}:`,
+                    error,
+                  );
+                  const linkState = linkStateRef.current[mainUserId];
+                  const fallbackName =
+                    (typeof linkState?.mainUserName === "string" &&
+                      linkState.mainUserName) ||
+                    "User Load Error";
+                  const fallbackAvatar =
+                    typeof linkState?.mainUserAvatar === "string"
+                      ? linkState.mainUserAvatar
+                      : undefined;
+                  const { initials, colorClass } = initialsAndColor(fallbackName);
+                  setMainUsers((prev) => {
+                    const map = new Map(prev.map((u) => [u.mainUserUid, u]));
+                    map.set(mainUserId, {
+                      mainUserUid: mainUserId,
+                      name: fallbackName,
+                      avatar: fallbackAvatar,
+                      initials,
+                      colorClass,
+                      status: "Inactive",
+                    } as MainUserCard);
+                    return Array.from(map.values()).sort((a, b) =>
+                      a.name.localeCompare(b.name),
+                    );
+                  });
+                },
+              );
+            });
+
+            // drop any cards that are no longer linked
+            setMainUsers((prev) => {
+              const valid = new Set(
+                Object.keys(unsubsRef.current).filter(
+                  (k) => k !== LINKS_KEY && !k.startsWith("link:"),
+                ),
+              );
+              return prev.filter((u) => valid.has(u.mainUserUid));
+            });
+          },
+        );
       }
 
-      wireLinksListener(linksByEmergencyContactUid as FsQuery<DocumentData>, LINKS_KEY);
+      wireLinksListener(
+        linksByEmergencyContactUid as FsQuery<DocumentData>,
+        LINKS_KEY,
+      );
     });
 
     return () => {
@@ -495,6 +726,7 @@ export default function EmergencyDashboardPage() {
       unsubAuth();
       Object.values(unsubsRef.current).forEach((fn) => fn());
       unsubsRef.current = {};
+      linkStateRef.current = {};
     };
   }, [router]);
 
@@ -518,7 +750,9 @@ export default function EmergencyDashboardPage() {
       setNoLocationUser(user);
       return;
     }
-    const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
+    const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+      loc,
+    )}`;
     window.open(mapsUrl, "_blank", "noopener,noreferrer");
   };
 
@@ -531,7 +765,10 @@ export default function EmergencyDashboardPage() {
             Emergency Contact Dashboard
           </h1>
           {emergencyContactUid && (
-            <Button variant="outline" onClick={() => router.push("/emergency-settings")}>
+            <Button
+              variant="outline"
+              onClick={() => router.push("/emergency-settings")}
+            >
               <SettingsIcon className="h-5 w-5 mr-2" />
               Settings
             </Button>
@@ -540,7 +777,9 @@ export default function EmergencyDashboardPage() {
 
         {loading && <p>Loading your people…</p>}
         {!loading && mainUsers.length === 0 && (
-          <p className="opacity-70">No linked users yet. Ask them to send you an invite.</p>
+          <p className="opacity-70">
+            No linked users yet. Ask them to send you an invite.
+          </p>
         )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -556,14 +795,20 @@ export default function EmergencyDashboardPage() {
                 <CardHeader className="flex flex-row items-center gap-4">
                   <Avatar className="h-16 w-16">
                     <AvatarImage src={p.avatar || ""} alt={p.name} />
-                    <AvatarFallback className={`${p.colorClass} text-foreground`}>
+                    <AvatarFallback
+                      className={`${p.colorClass} text-foreground`}
+                    >
                       {p.initials}
                     </AvatarFallback>
                   </Avatar>
                   <div>
-                    <CardTitle className="text-2xl font-headline">{p.name}</CardTitle>
+                    <CardTitle className="text-2xl font-headline">
+                      {p.name}
+                    </CardTitle>
                     <CardDescription>
-                      {p.lastCheckIn ? `Last check-in: ${p.lastCheckIn}` : "—"}
+                      {p.lastCheckIn
+                        ? `Last check-in: ${p.lastCheckIn}`
+                        : "—"}
                     </CardDescription>
                   </div>
                 </CardHeader>
@@ -571,10 +816,39 @@ export default function EmergencyDashboardPage() {
                 <CardContent className="space-y-4">
                   <div className="flex justify-between items-center">
                     <p className="font-semibold">Status:</p>
-                    <Badge variant={getStatusVariant(p.status)} className="text-md px-3 py-1">
+                    <Badge
+                      variant={getStatusVariant(p.status)}
+                      className="text-md px-3 py-1"
+                    >
                       {p.status || "—"}
                     </Badge>
                   </div>
+
+                  {p.moodSummary && (
+                    <div className="flex items-start gap-3 rounded-md border p-3">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10 text-primary">
+                        <Smile className="h-4 w-4" aria-hidden />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold">
+                          Mood:{" "}
+                          <span className="capitalize">
+                            {p.moodSummary.mood}
+                          </span>
+                        </p>
+                        {p.moodSummary.description && (
+                          <p className="text-sm text-muted-foreground">
+                            {p.moodSummary.description}
+                          </p>
+                        )}
+                        {p.moodSummary.updatedAt && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            Updated {formatWhen(p.moodSummary.updatedAt)}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   <div className="flex justify-between items-center">
                     <p className="font-semibold">Location status:</p>
@@ -603,7 +877,11 @@ export default function EmergencyDashboardPage() {
                           p.locationShareReason === "sos"
                             ? "for an SOS alert"
                             : "during an escalation"
-                        }${p.locationSharedAt ? ` at ${formatWhen(p.locationSharedAt)}` : ""}.`
+                        }${
+                          p.locationSharedAt
+                            ? ` at ${formatWhen(p.locationSharedAt)}`
+                            : ""
+                        }.`
                       : p.locationSharing
                       ? "Location will appear here if they trigger SOS or an escalation."
                       : "They have not granted location sharing, so no location is available."}
@@ -625,9 +903,15 @@ export default function EmergencyDashboardPage() {
                       <div className="flex items-start justify-between gap-4">
                         <div className="flex items-center gap-2 text-sm font-semibold">
                           {p.latestVoiceMessage.anomalyDetected ? (
-                            <ShieldAlert className="h-4 w-4 text-destructive" aria-hidden />
+                            <ShieldAlert
+                              className="h-4 w-4 text-destructive"
+                              aria-hidden
+                            />
                           ) : (
-                            <ShieldCheck className="h-4 w-4 text-green-600" aria-hidden />
+                            <ShieldCheck
+                              className="h-4 w-4 text-green-600"
+                              aria-hidden
+                            />
                           )}
                           <span>Latest voice update</span>
                         </div>
@@ -652,7 +936,12 @@ export default function EmergencyDashboardPage() {
                           <Button
                             variant="secondary"
                             size="sm"
-                            onClick={() => handleToggleAudioPlayback(p.mainUserUid, p.name)}
+                            onClick={() =>
+                              handleToggleAudioPlayback(
+                                p.mainUserUid,
+                                p.name,
+                              )
+                            }
                             aria-label={
                               playingUid === p.mainUserUid
                                 ? `Stop ${p.name}'s voice message`
@@ -664,7 +953,9 @@ export default function EmergencyDashboardPage() {
                             ) : (
                               <Play className="mr-2 h-4 w-4" aria-hidden />
                             )}
-                            {playingUid === p.mainUserUid ? "Stop message" : "Play message"}
+                            {playingUid === p.mainUserUid
+                              ? "Stop message"
+                              : "Play message"}
                           </Button>
                           <span className="text-xs text-muted-foreground">
                             {playingUid === p.mainUserUid
@@ -696,7 +987,9 @@ export default function EmergencyDashboardPage() {
                         variant="secondary"
                         onClick={() => handleViewOnMap(p)}
                         aria-label={`View ${p.name} on map`}
-                        disabled={!p.locationShareReason || !(p.location || "").trim()}
+                        disabled={
+                          !p.locationShareReason || !(p.location || "").trim()
+                        }
                       >
                         <MapPin className="mr-2 h-4 w-4" />
                         View on Map
@@ -726,12 +1019,26 @@ export default function EmergencyDashboardPage() {
                       Call
                     </Button>
                   )}
-                  <Button variant="outline">
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setVoiceTargetMainUser({
+                        uid: p.mainUserUid,
+                        name: p.name,
+                        phone: p.phone ?? undefined,
+                      });
+                      setVoiceModalOpen(true);
+                    }}
+                    aria-label={`Send a voice message to ${p.name}`}
+                  >
                     <MessageSquare className="mr-2 h-4 w-4" />
-                    Message
+                    Voice Message
                   </Button>
                   {p.status === "SOS" && (
-                    <Button className="col-span-2" onClick={() => handleAcknowledge(p.name)}>
+                    <Button
+                      className="col-span-2"
+                      onClick={() => handleAcknowledge(p.name)}
+                    >
                       Acknowledge Alert
                     </Button>
                   )}
@@ -743,8 +1050,42 @@ export default function EmergencyDashboardPage() {
       </main>
       <Footer />
 
+      {/* Voice Message modal (EC → Main User) */}
+      <Dialog
+        open={voiceModalOpen}
+        onOpenChange={(open) => {
+          setVoiceModalOpen(open);
+          if (!open) setVoiceTargetMainUser(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Send a voice message</DialogTitle>
+            <DialogDescription>
+              {voiceTargetMainUser
+                ? `Record a quick update to ${voiceTargetMainUser.name}.`
+                : "Record a quick voice message."}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="py-2">
+            <VoiceCheckIn
+              // IMPORTANT: Your VoiceCheckIn should use this to target the
+              // selected main user (EC → MainUser flow).
+              sendToUid={voiceTargetMainUser?.uid}
+              
+              onCheckIn={handleVoiceToMainDone}
+              onClearTarget={() => setVoiceTargetMainUser(null)}
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Centered popup when location is missing */}
-      <Dialog open={!!noLocationUser} onOpenChange={(open) => !open && setNoLocationUser(null)}>
+      <Dialog
+        open={!!noLocationUser}
+        onOpenChange={(open) => !open && setNoLocationUser(null)}
+      >
         <DialogContent className="sm:max-w-[420px]">
           <DialogHeader>
             <DialogTitle>Location unavailable</DialogTitle>

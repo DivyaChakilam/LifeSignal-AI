@@ -1,3 +1,4 @@
+//functions/src/index.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { initializeApp } from "firebase-admin/app";
@@ -16,17 +17,15 @@ import * as logger from "firebase-functions/logger";
 import axios from "axios";
 
 initializeApp();
-const db = getFirestore();
 
-/** ---------------------------
- *  Secrets (v2 Functions)
- *  --------------------------- */
-// NOTE: TELNYX_APPLICATION_ID holds your Voice API App ID (used as connection_id in /v2/calls)
+const db = getFirestore();
+const messaging = getMessaging();
+
 const S_TELNYX_API_KEY = defineSecret("TELNYX_API_KEY");
 const S_TELNYX_APPLICATION_ID = defineSecret("TELNYX_APPLICATION_ID");
 const S_TELNYX_FROM_NUMBER = defineSecret("TELNYX_FROM_NUMBER");
 
-/** Read secrets with optional process.env fallback for local emulator/dev. */
+/** Small helper so we use env as a fallback for local emulator/dev. */
 function getTelnyx() {
   return {
     apiKey: S_TELNYX_API_KEY.value() || process.env.TELNYX_API_KEY,
@@ -38,8 +37,27 @@ function getTelnyx() {
 const TELNYX_API = "https://api.telnyx.com/v2";
 
 /** Telnyx-friendly E.164: + and 7–14 more digits (8–15 total) */
-function isE164(v?: string): v is string {
-  return typeof v === "string" && /^\+[1-9]\d{7,14}$/.test(v.trim());
+function isE164(phone?: string | null): boolean {
+  if (!phone) return false;
+  return /^\+[0-9]{7,14}$/.test(phone);
+}
+
+function toMillis(ts?: any): number {
+  try {
+    if (ts == null) return 0;
+
+    // Firestore Timestamp-like
+    if (typeof ts?.toMillis === "function") return ts.toMillis();
+    if (typeof ts?.toDate === "function") return ts.toDate().getTime();
+
+    // Already a Date or number
+    if (ts instanceof Date) return ts.getTime();
+    if (typeof ts === "number") return ts;
+
+    return 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** Batch helper to avoid the 500-writes limit. */
@@ -71,18 +89,13 @@ export const syncEmergencyContactProfile = onDocumentWritten(
       "lastName",
       "email",
       "phone",
-      "defaultChannel",
-      "avatar",
-      "quietStart",
-      "quietEnd",
+      "relationship",
+      "photoUrl",
     ];
-    const changed = watched.some((k) => (before as any)[k] !== (after as any)[k]);
+
+    const changed = watched.some((k) => before[k] !== after[k]);
     if (!changed) return;
 
-    const fullName = `${(after.firstName || "").trim()} ${(after.lastName || "")
-      .trim()}`.trim();
-    const newEmail = String(after.email || "");
-    const oldEmail = String(before.email || newEmail);
     const nowTs = FieldValue.serverTimestamp();
 
     // 1) Update all /users/{mainUserUid}/emergency_contact/* links for this EC
@@ -99,20 +112,18 @@ export const syncEmergencyContactProfile = onDocumentWritten(
       const mainUserUid = link.ref.parent.parent?.id;
       if (mainUserUid) mainUserUids.add(mainUserUid);
 
-      batch.set(
-        link.ref,
-        {
-          name: fullName,
-          email: newEmail || null,
-          phone: after.phone || null,
-          emergencyContactUid,
-          updatedAt: nowTs,
-        },
-        { merge: true }
-      );
+      const patch: any = {
+        updatedAt: nowTs,
+      };
+      for (const k of watched) {
+        patch[`profile.${k}`] = after[k] ?? null;
+      }
+
+      batch.update(link.ref, patch);
       ops.count++;
       batch = await commitOrRotate(batch, ops);
     }
+
     if (ops.count) await batch.commit();
 
     // 2) Optional mirror top-level collection
@@ -124,94 +135,45 @@ export const syncEmergencyContactProfile = onDocumentWritten(
     if (!topSnap.empty) {
       let b = db.batch();
       const o = { count: 0 };
-      for (const d of topSnap.docs) {
-        b.set(
-          d.ref,
-          {
-            emergencyContactEmail: newEmail || null,
-            name: fullName,
-            phone: after.phone || null,
-            updatedAt: nowTs,
-          },
-          { merge: true }
-        );
+
+      for (const doc of topSnap.docs) {
+        const patch: any = {
+          updatedAt: nowTs,
+        };
+        for (const k of watched) {
+          patch[k] = after[k] ?? null;
+        }
+        b.update(doc.ref, patch);
         o.count++;
         b = await commitOrRotate(b, o);
       }
+
       if (o.count) await b.commit();
     }
 
-    // 3) Update embedded summary on each main user (for UI)
-    for (const mainUserUid of Array.from(mainUserUids)) {
-      const userRef = db.doc(`users/${mainUserUid}`);
-      const userSnap = await userRef.get();
-      if (!userSnap.exists) continue;
-
-      const u = userSnap.data() || {};
-      const ec = (u as any).emergencyContacts || {};
-      const updates: Record<string, any> = {};
-
-      if (
-        ec.contact1_email &&
-        (ec.contact1_email === oldEmail || ec.contact1_email === newEmail)
-      ) {
-        updates["emergencyContacts.contact1_firstName"] = after.firstName || "";
-        updates["emergencyContacts.contact1_lastName"] = after.lastName || "";
-        updates["emergencyContacts.contact1_phone"] = after.phone || "";
-        updates["emergencyContacts.contact1_email"] = newEmail;
-      }
-      if (
-        ec.contact2_email &&
-        (ec.contact2_email === oldEmail || ec.contact2_email === newEmail)
-      ) {
-        updates["emergencyContacts.contact2_firstName"] = after.firstName || "";
-        updates["emergencyContacts.contact2_lastName"] = after.lastName || "";
-        updates["emergencyContacts.contact2_phone"] = after.phone || "";
-        updates["emergencyContacts.contact2_email"] = newEmail;
-      }
-
-      if (Object.keys(updates).length) {
-        updates["updatedAt"] = nowTs;
-        await userRef.set(updates, { merge: true });
-      }
-    }
+    logger.info("syncEmergencyContactProfile updated", {
+      emergencyContactUid,
+      linkedUsers: Array.from(mainUserUids),
+    });
   }
 );
 
-/** ---------------------------
- *  Utilities for escalation
- *  --------------------------- */
-
-function toMillis(ts?: any): number {
-  try {
-    if (ts == null) return 0;
-
-    // Firestore Timestamp-like
-    if (typeof ts?.toMillis === "function") return ts.toMillis();
-    if (typeof ts?.toDate === "function") return ts.toDate().getTime();
-
-    // Already a Date
-    if (ts instanceof Date) return ts.getTime();
-
-    // Number (assumed ms)
-    if (typeof ts === "number" && Number.isFinite(ts)) return ts;
-
-    // String: numeric or ISO
-    if (typeof ts === "string") {
-      const n = Number(ts);
-      if (Number.isFinite(n)) return n;
-      const d = new Date(ts);
-      const t = d.getTime();
-      if (!Number.isNaN(t)) return t;
-    }
-  } catch (err) {
-    logger.warn("toMillis parse error", (err as any)?.message);
-  }
-  return 0;
-}
-
-/** ACTIVE ECs sorted by sentCountInWindow -> lastNotifiedAt -> createdAt */
-async function getActiveEmergencyContacts(mainUserUid: string) {
+/** Find ACTIVE emergency contacts, sorted by how many notifications
+ *  they got in the current window (for round-robin behaviour).
+ */
+async function getActiveEmergencyContacts(
+  mainUserUid: string
+): Promise<
+  Array<{
+    id: string;
+    phone: string;
+    emergencyContactUid?: string;
+    sentCountInWindow?: number;
+    lastNotifiedAt?: any;
+    createdAt?: any;
+    notificationSettings?: any;
+  }>
+> {
   const snap = await db
     .collection(`users/${mainUserUid}/emergency_contact`)
     .where("status", "==", "ACTIVE")
@@ -219,34 +181,25 @@ async function getActiveEmergencyContacts(mainUserUid: string) {
 
   const contacts = snap.docs
     .map((d) => ({ id: d.id, ...(d.data() as any) }))
-    .filter((c) => isE164((c as any).phone)); // only valid E.164 phones
+    .filter((c) => isE164((c as any).phone));
 
   contacts.sort((a: any, b: any) => {
     const aCount = Number(a.sentCountInWindow || 0);
     const bCount = Number(b.sentCountInWindow || 0);
     if (aCount !== bCount) return aCount - bCount;
 
-    const aLast = toMillis(a.lastNotifiedAt);
-    const bLast = toMillis(b.lastNotifiedAt);
-    if (aLast !== bLast) return aLast - bLast;
-
     const aCreated = toMillis(a.createdAt);
     const bCreated = toMillis(b.createdAt);
     return aCreated - bCreated;
   });
 
-  return contacts as Array<{
-    id: string;
-    phone: string;
-    emergencyContactUid?: string;
-    sentCountInWindow?: number;
-    lastNotifiedAt?: any;
-    createdAt?: any;
-  }>;
+  return contacts;
 }
 
 /** Collect ACTIVE EC UIDs for push targeting */
-async function getActiveEmergencyContactUids(mainUserUid: string): Promise<string[]> {
+async function getActiveEmergencyContactUids(
+  mainUserUid: string
+): Promise<string[]> {
   const snap = await db
     .collection(`users/${mainUserUid}/emergency_contact`)
     .where("status", "==", "ACTIVE")
@@ -263,166 +216,111 @@ async function getActiveEmergencyContactUids(mainUserUid: string): Promise<strin
 async function getFcmTokensForUser(uid: string): Promise<string[]> {
   try {
     const snap = await db.collection(`users/${uid}/devices`).get();
+
     const tokens = snap.docs
       .map((d) => {
         const data = d.data() as any;
-        // support either "fcmToken" or "token" field
-        const t = String(data?.fcmToken || data?.token || "").trim();
-        const disabled = Boolean(data?.disabled);
-        return !disabled && t ? t : null;
+        // Support both field names: "token" and "fcmToken"
+        return data.fcmToken || data.token;
       })
-      .filter(Boolean) as string[];
+      .filter((t) => typeof t === "string" && t.length > 0);
+
     return Array.from(new Set(tokens));
-  } catch (e: any) {
-    logger.error("getFcmTokensForUser failed", e?.message);
+  } catch (err: any) {
+    logger.error("getFcmTokensForUser error", { uid, error: err?.message });
     return [];
   }
 }
 
-/** Multicast push to many tokens (silently ignores empty list) */
-async function sendPushToTokens(tokens: string[], notif: {
-  title: string;
-  body: string;
-}, data: Record<string, string> = {}) {
+/** Send a single push payload to a list of tokens. */
+async function sendPushToTokens(
+  tokens: string[],
+  notification: { title: string; body: string },
+  data: Record<string, string>
+) {
   if (!tokens.length) return;
+
+  const message = {
+    notification,
+    data,
+    tokens,
+  };
+
   try {
-    const messaging = getMessaging();
-    await messaging.sendEachForMulticast({
-      tokens,
-      notification: {
-        title: notif.title,
-        body: notif.body,
-      },
-      data, // key/value strings
-      android: { priority: "high" },
-      apns: {
-        headers: { "apns-priority": "10" },
-        payload: { aps: { sound: "default" } },
-      },
+    const resp = await messaging.sendEachForMulticast(message);
+    logger.info("sendPushToTokens result", {
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
     });
-  } catch (e: any) {
-    logger.error("sendPushToTokens failed", e?.message);
+  } catch (err: any) {
+    logger.error("sendPushToTokens error", err?.message);
   }
 }
 
-/** ---------------------------
- *  Policy setter (UI can call)
- *  --------------------------- */
-export const updateEscalationPolicy = onRequest(async (req, res) => {
-  try {
-    const { mainUserUid, mode, callDelaySec = 60 } = req.body || {};
-    if (!mainUserUid || !["push_then_call", "call_immediately"].includes(mode)) {
-      res.status(400).json({ ok: false, error: "Invalid payload: mainUserUid/mode" });
-      return;
-    }
-
-    await db.doc(`users/${mainUserUid}`).set(
-      {
-        escalationPolicy: {
-          version: 1,
-          mode,
-          callDelaySec: Number(callDelaySec) || 60,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-      },
-      { merge: true }
-    );
-
-    res.json({ ok: true });
-  } catch (e: any) {
-    logger.error("updateEscalationPolicy", e?.message);
-    res.status(500).json({ ok: false, error: e?.message });
-  }
-});
-
-/** ---------------------------
- *  Place a call (backend/HTTP)
- *  --------------------------- */
-export const makeCall = onRequest(
-  { secrets: [S_TELNYX_API_KEY, S_TELNYX_APPLICATION_ID, S_TELNYX_FROM_NUMBER] },
-  async (req, res) => {
-    try {
-      const { apiKey, appId, from } = getTelnyx(); // appId is the Voice API App ID
-      if (!apiKey) {
-        res.status(500).json({ ok: false, error: "TELNYX_API_KEY is not set" });
-        return;
-      }
-
-      const to = String(req.body?.to || "").trim();
-      const mainUserUid = req.body?.mainUserUid ? String(req.body.mainUserUid) : undefined;
-      const emergencyContactUid = req.body?.emergencyContactUid ? String(req.body.emergencyContactUid) : undefined;
-
-      if (!to) {
-        res.status(400).json({ ok: false, error: "Missing 'to' number" });
-        return;
-      }
-      if (!isE164(to)) {
-        res.status(400).json({ ok: false, error: "Destination must be E.164 (e.g. +15551234567)" });
-        return;
-      }
-      if (from && !isE164(String(from))) {
-        res.status(400).json({ ok: false, error: "Configured TELNYX_FROM_NUMBER must be E.164" });
-        return;
-      }
-      if (!appId) {
-        res.status(500).json({ ok: false, error: "TELNYX_APPLICATION_ID (Voice API App ID) is not set" });
-        return;
-      }
-
-      const clientState = Buffer
-        .from(JSON.stringify({ mainUserUid, emergencyContactUid, reason: "escalation" }))
-        .toString("base64");
-
-      const payload = {
-        connection_id: appId,
-        to,
-        from,
-        client_state: clientState,
-      };
-
-      const { data } = await axios.post(`${TELNYX_API}/calls`, payload, {
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-      });
-
-      res.status(200).json({ ok: true, call: data?.data });
-    } catch (err: any) {
-      logger.error("makeCall error", err?.response?.data || err?.message);
-      res.status(500).json({ ok: false, error: err?.response?.data || err?.message });
-    }
-  }
-);
-
-/** ---------------------------------------
- *  Telnyx webhook (set this URL in Telnyx)
- *  --------------------------------------- */
+/** ------------------------------------------------------
+ *  Telnyx webhook — call status / DTMF / etc
+ *  ------------------------------------------------------ */
 export const telnyxWebhook = onRequest(
-  { secrets: [S_TELNYX_API_KEY, S_TELNYX_APPLICATION_ID, S_TELNYX_FROM_NUMBER] },
+  {
+    region: "us-central1",
+    secrets: [S_TELNYX_API_KEY, S_TELNYX_APPLICATION_ID, S_TELNYX_FROM_NUMBER],
+  },
   async (req, res) => {
-    // ACK immediately
-    res.status(200).send("ok");
-
     try {
       const { apiKey } = getTelnyx();
-      const evt = req.body?.data;
-      if (!evt) return;
+      const event = req.body?.data?.record || req.body?.data || req.body;
 
-      const eventType: string = evt.event_type;
-      const callControlId: string | undefined = evt.payload?.call_control_id;
-      const callSessionId: string | undefined = evt.payload?.call_session_id;
+      const eventType = event?.event_type || event?.type;
+      const callControlId =
+        event?.payload?.call_control_id || event?.call_control_id;
+      const clientStateRaw =
+        event?.payload?.client_state || event?.client_state || null;
 
-      logger.info(`Telnyx event: ${eventType}`, { callSessionId, callControlId });
+      let clientState: any = null;
+      if (clientStateRaw) {
+        try {
+          const decoded = Buffer.from(clientStateRaw, "base64").toString(
+            "utf-8"
+          );
+          clientState = JSON.parse(decoded);
+        } catch (err: any) {
+          logger.error("Failed to decode client_state", err?.message);
+        }
+      }
 
-      if (callSessionId) {
-        await db.collection("telnyxCalls").doc(callSessionId).set(
-          {
-            lastEvent: eventType,
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
+      logger.info("telnyxWebhook received", {
+        eventType,
+        callControlId,
+        clientState,
+      });
+
+      // If user presses 1 on keypad, mark escalation acknowledged
+      if (eventType === "call.dtmf.received") {
+        const digit = event?.payload?.digit || event?.digit;
+        if (digit === "1" && clientState?.mainUserUid) {
+          const { mainUserUid } = clientState;
+
+          try {
+            await db
+              .collection("users")
+              .doc(mainUserUid)
+              .set(
+                {
+                  lastEscalationAcknowledgedAt: FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+              );
+
+            logger.info("Escalation acknowledged via Telnyx DTMF", {
+              mainUserUid,
+            });
+          } catch (err: any) {
+            logger.error(
+              "Failed to mark escalation acknowledged",
+              err?.message
+            );
+          }
+        }
       }
 
       // When the call is answered, speak a short message
@@ -437,17 +335,142 @@ export const telnyxWebhook = onRequest(
           },
           {
             headers: {
-              "Authorization": `Bearer ${apiKey}`,
+              Authorization: `Bearer ${apiKey}`,
               "Content-Type": "application/json",
             },
           }
         );
       }
+
+      res.status(200).json({ ok: true });
     } catch (e: any) {
       logger.error("telnyxWebhook error", e?.response?.data || e?.message);
+      res.status(500).json({ ok: false });
     }
   }
 );
+
+/** ------------------------------------------------------
+ *  Notification config helpers (main user + EC)
+ *  ------------------------------------------------------ */
+
+type NotificationMode = "PUSH_ONLY" | "PUSH_PLUS_CALL" | "CALL_ONLY";
+
+/**
+ * Main user's built-in notification config (timings, batch size, etc).
+ * This matches your original structure.
+ */
+interface MainNotificationConfig {
+  mode: NotificationMode;
+  pushIntervalMin: number; // how often we send a batch (minutes)
+  pushBatchSize: number; // number of pushes in a "set"
+  callDelayMin: number; // N-minute delay before calling (for PUSH_PLUS_CALL)
+}
+
+/**
+ * Extra user-configurable push counts from your UI:
+ * - pushOnlyCount: how many push rounds for "Push Only"
+ * - pushThenCallCount: how many push rounds before calling in "Push → Then Call"
+ */
+interface UserPushConfig {
+  pushOnlyCount: number;
+  pushThenCallCount: number;
+}
+
+/** Emergency contact notification config, independent of user push counts. */
+interface EcNotificationConfig extends MainNotificationConfig {
+  escalationDelayMin: number; // when to start EC escalation at all (minutes)
+}
+
+function normalizeNotificationMode(
+  raw: any,
+  fallback: NotificationMode
+): NotificationMode {
+  if (!raw || typeof raw !== "string") return fallback;
+  const v = raw.toLowerCase().replace(/\s+/g, "");
+
+  if (v === "pushonly") return "PUSH_ONLY";
+  if (v === "push+call" || v === "pushandcall" || v === "push_plus_call") {
+    return "PUSH_PLUS_CALL";
+  }
+  if (v === "callonly" || v === "call") return "CALL_ONLY";
+
+  return fallback;
+}
+
+/**
+ * Main user's notification settings.
+ *
+ * Expected Firestore shape (example):
+ *  users/{uid}.mainNotification = {
+ *    mode: "Push only" | "Push+call" | "Call",
+ *    pushIntervalMin: 10,
+ *    pushBatchSize: 3,
+ *    callDelayMin: 20
+ *  }
+ *
+ * Plus:
+ *  users/{uid}.pushOnlyCount?: number
+ *  users/{uid}.pushThenCallCount?: number
+ */
+function resolveMainNotificationConfig(
+  u: any
+): MainNotificationConfig & UserPushConfig {
+  const cfg = u?.mainNotification || {};
+
+  // Normalize mode
+  const mode = normalizeNotificationMode(cfg.mode, "PUSH_PLUS_CALL");
+
+  // Interval + batch logic (original behavior)
+  const pushIntervalMin = Number(cfg.pushIntervalMin ?? 10) || 10;
+  const pushBatchSize = Number(cfg.pushBatchSize ?? 1) || 1;
+  const callDelayMin = Number(cfg.callDelayMin ?? 20) || 20;
+
+  // NEW — user-selected push counts from the UI, with defaults
+  const pushOnlyCount = Number(u.pushOnlyCount ?? 3) || 3;
+  const pushThenCallCount = Number(u.pushThenCallCount ?? 3) || 3;
+
+  return {
+    mode,
+    pushIntervalMin,
+    pushBatchSize,
+    callDelayMin,
+    pushOnlyCount,
+    pushThenCallCount,
+  };
+}
+
+/**
+ * Emergency contact’s escalation/notification config.
+ *
+ * Expected Firestore shape on the EC link doc:
+ *  users/{mainUserUid}/emergency_contact/{id}.notificationSettings = {
+ *    mode: "Push only" | "Push+call" | "Call",
+ *    pushIntervalMin: 10,
+ *    pushBatchSize: 3,
+ *    callDelayMin: 20,
+ *    escalationDelayMin: 30 // when to start EC escalation at all
+ *  }
+ *
+ * All fields are optional; defaults are taken from the product spec.
+ */
+function resolveEcNotificationConfig(linkDoc: any): EcNotificationConfig {
+  const cfg = linkDoc?.notificationSettings || {};
+
+  const mode = normalizeNotificationMode(cfg.mode, "PUSH_PLUS_CALL");
+  const pushIntervalMin = Number(cfg.pushIntervalMin ?? 10) || 10;
+  const pushBatchSize = Number(cfg.pushBatchSize ?? 3) || 3;
+  const callDelayMin = Number(cfg.callDelayMin ?? 20) || 20;
+  const escalationDelayMin = Number(cfg.escalationDelayMin ?? 30) || 30;
+
+  return {
+    mode,
+    pushIntervalMin,
+    pushBatchSize,
+    callDelayMin,
+    escalationDelayMin,
+  };
+}
 
 /** ------------------------------------------------------
  *  Core Escalation Job (shared by HTTP + Scheduler)
@@ -457,7 +480,6 @@ async function runEscalationScanJob(input: { cooldownMin?: number } = {}) {
   if (!apiKey) throw new Error("TELNYX_API_KEY is not set");
 
   const now = Date.now();
-  const cooldownMin = Number(input.cooldownMin ?? 10); // minutes
 
   const usersSnap = await db
     .collection("users")
@@ -466,212 +488,361 @@ async function runEscalationScanJob(input: { cooldownMin?: number } = {}) {
     .get();
 
   const processed: string[] = [];
-  let escalationsQueued = 0;
+  let telnyxCallsQueued = 0;
 
   for (const doc of usersSnap.docs) {
     const mainUserUid = doc.id;
     const u: any = doc.data() || {};
+    const userRef = doc.ref;
 
-    // Overdue?
+    // Compute check-in due time
     const lastCheckinAtMs =
       (u.lastCheckinAt?.toDate?.()?.getTime?.() as number | undefined) ?? 0;
     const intervalMin = Number(u.checkinInterval ?? 60);
     const dueAtMs = lastCheckinAtMs + intervalMin * 60_000;
 
-    // Throttle how often we notify
-    const lastNotifiedMs =
-      (u.missedNotifiedAt?.toDate?.()?.getTime?.() as number | undefined) ?? 0;
-
-    if (now < dueAtMs) continue;
-    if (lastNotifiedMs && now - lastNotifiedMs < cooldownMin * 60_000) continue;
-
-    // Policy (UI-set or default)
-    const policy: { mode: "push_then_call" | "call_immediately"; callDelaySec: number } =
-      u.escalationPolicy || { mode: "push_then_call", callDelaySec: 60 };
-
-    // Prefer ACTIVE contact in subcollection; fall back to embedded
-    const activeContacts = await getActiveEmergencyContacts(mainUserUid);
-    const top = activeContacts[0];
-    const fallbackPhone = u.emergencyContacts?.contact1_phone || null;
-
-    const contactPhone = (top?.phone || fallbackPhone) as string | null;
-    const emergencyContactUid = top?.emergencyContactUid || null;
-    const ecDocId = top?.id || null;
-
-    if (!contactPhone) {
-      logger.warn("No contact phone found for user", { mainUserUid });
+    if (now < dueAtMs) {
+      // Not overdue yet.
       continue;
     }
 
-    // Mark that we started escalation to prevent duplicate scans
-    await db.doc(`users/${mainUserUid}`).set(
-      { missedNotifiedAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
+    // If user checked in again after a previous missed cycle, reset state.
+    let missedStartedAtMs = toMillis(u.missedStartedAt);
+    const userUpdates: Record<string, any> = {};
 
-    // If we used a subcollection doc, bump its counters (best-effort)
-    if (ecDocId) {
-      const ecRef = db.doc(`users/${mainUserUid}/emergency_contact/${ecDocId}`);
-      await ecRef.set(
-        {
-          lastNotifiedAt: FieldValue.serverTimestamp(),
-          sentCountInWindow: FieldValue.increment(1),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+    if (!missedStartedAtMs || lastCheckinAtMs > missedStartedAtMs) {
+      missedStartedAtMs = now;
+      userUpdates.missedStartedAt = FieldValue.serverTimestamp();
+      userUpdates.mainNotifyRounds = 0;
+      userUpdates.mainLastNotifiedAt = null;
+      userUpdates.mainCallPlaced = false;
+      userUpdates.ecNotifyRounds = 0;
+      userUpdates.ecLastNotifiedAt = null;
+      userUpdates.ecCallPlaced = false;
     }
 
-    // Best-effort "display" name
+    const elapsedMin = (now - missedStartedAtMs) / 60_000;
+
+    // Local state (updated and persisted at end)
+    let mainNotifyRounds = Number(u.mainNotifyRounds ?? 0);
+    let mainLastNotifiedAtMs = toMillis(u.mainLastNotifiedAt);
+    let mainCallPlaced = Boolean(u.mainCallPlaced);
+
+    let ecNotifyRounds = Number(u.ecNotifyRounds ?? 0);
+    let ecLastNotifiedAtMs = toMillis(u.ecLastNotifiedAt);
+    let ecCallPlaced = Boolean(u.ecCallPlaced);
+
+    // Main user configuration (includes your custom counts)
+    const mainCfg = resolveMainNotificationConfig(u);
+    const mainUserPhone = isE164(u.phone) ? String(u.phone) : null;
+
     const mainUserName =
-      (u.firstName || u.lastName) ?
-        `${u.firstName || ""} ${u.lastName || ""}`.trim() :
-        "a user";
+      (u.firstName || u.lastName)
+        ? `${u.firstName || ""} ${u.lastName || ""}`.trim()
+        : "a user";
 
-    if (policy.mode === "call_immediately") {
-      // (Optional) Push to ECs informing a call is being placed now
-      try {
-        const ecUids = await getActiveEmergencyContactUids(mainUserUid);
-        if (ecUids.length) {
-          const tokens = (await Promise.all(ecUids.map(getFcmTokensForUser))).flat();
-          await sendPushToTokens(
-            tokens,
-            {
-              title: "Life Signal: calling now",
-              body: `${mainUserName} missed a check-in. We are calling you now.`,
-            },
-            { type: "missed_checkin_calling", mainUserUid }
-          );
-        }
-      } catch (e) {
-        logger.warn("call_immediately push failed (non-fatal)", (e as any)?.message);
+    // Helper to send a batch of pushes to the main user.
+    const sendPushBatchToMainUser = async (batchSize: number) => {
+      const tokens = await getFcmTokensForUser(mainUserUid);
+      if (!tokens.length) return;
+
+      for (let i = 0; i < batchSize; i++) {
+        await sendPushToTokens(
+          tokens,
+          {
+            title: "Life Signal: missed check-in",
+            body: "You missed a scheduled check-in. Please open the app and check in.",
+          },
+          {
+            type: "missed_checkin_main_user",
+            mainUserUid,
+          }
+        );
       }
+    };
 
-      // Call now (guard E.164)
-      if (!isE164(String(contactPhone))) {
-        logger.warn("Immediate call skipped: non-E.164 phone", { mainUserUid, contactPhone });
-      } else {
-        const clientState = Buffer
-          .from(JSON.stringify({ mainUserUid, emergencyContactUid, reason: "escalation" }))
-          .toString("base64");
+    // ----------------------------
+    // STEP 1: Notify main user
+    // ----------------------------
+
+    if (mainCfg.mode === "CALL_ONLY") {
+      // Call immediately when the missed cycle begins
+      if (!mainCallPlaced && mainUserPhone && appId) {
+        const clientState = Buffer.from(
+          JSON.stringify({
+            mainUserUid,
+            emergencyContactUid: null,
+            reason: "main_user_missed_checkin",
+          })
+        ).toString("base64");
 
         await axios.post(
           `${TELNYX_API}/calls`,
           {
-            connection_id: appId, // Voice API App ID
-            to: String(contactPhone),
+            connection_id: appId,
+            to: mainUserPhone,
             from,
             client_state: clientState,
           },
           {
             headers: {
-              "Authorization": `Bearer ${apiKey}`,
+              Authorization: `Bearer ${apiKey}`,
               "Content-Type": "application/json",
             },
           }
         );
-        escalationsQueued++;
+
+        mainCallPlaced = true;
+        userUpdates.mainCallPlaced = true;
+        telnyxCallsQueued++;
       }
     } else {
-      // Real push to ALL active ECs, then schedule Telnyx call
-      try {
-        const ecUids = await getActiveEmergencyContactUids(mainUserUid);
-        if (ecUids.length) {
-          const allTokens = (await Promise.all(ecUids.map((id) => getFcmTokensForUser(id)))).flat();
-          await sendPushToTokens(
-            allTokens,
-            {
-              title: "Life Signal: missed check-in",
-              body: `${mainUserName} missed a check-in. We’ll place a call shortly.`,
-            },
-            { type: "missed_checkin", mainUserUid }
-          );
-        } else {
-          logger.warn("No ACTIVE EC UIDs found for push", { mainUserUid });
+      // PUSH_ONLY or PUSH_PLUS_CALL
+
+      // ----------------------------
+      // PUSH-ONLY MODE
+      // ----------------------------
+      if (mainCfg.mode === "PUSH_ONLY") {
+        if (mainNotifyRounds < mainCfg.pushOnlyCount) {
+          const minutesSinceLastMainPush = mainLastNotifiedAtMs
+            ? (now - mainLastNotifiedAtMs) / 60_000
+            : Infinity;
+
+          if (
+            minutesSinceLastMainPush >= mainCfg.pushIntervalMin ||
+            mainNotifyRounds === 0
+          ) {
+            await sendPushBatchToMainUser(mainCfg.pushBatchSize);
+            mainNotifyRounds += 1;
+            mainLastNotifiedAtMs = now;
+
+            userUpdates.mainNotifyRounds = mainNotifyRounds;
+            userUpdates.mainLastNotifiedAt = FieldValue.serverTimestamp();
+          }
         }
-      } catch (e) {
-        logger.warn("push_then_call push failed (non-fatal)", (e as any)?.message);
+        // No call in PUSH_ONLY mode — just stop after pushOnlyCount rounds
       }
 
-      // Then schedule the call (store as Timestamp/Date)
-      const nextActionAt = new Date(Date.now() + Number(policy.callDelaySec || 60) * 1000);
-      await db.collection("escalations").add({
+      // ----------------------------
+      // PUSH → THEN CALL
+      // ----------------------------
+      if (mainCfg.mode === "PUSH_PLUS_CALL") {
+        // Send push rounds up to pushThenCallCount
+        if (mainNotifyRounds < mainCfg.pushThenCallCount) {
+          const minutesSinceLastMainPush = mainLastNotifiedAtMs
+            ? (now - mainLastNotifiedAtMs) / 60_000
+            : Infinity;
+
+          if (
+            minutesSinceLastMainPush >= mainCfg.pushIntervalMin ||
+            mainNotifyRounds === 0
+          ) {
+            await sendPushBatchToMainUser(mainCfg.pushBatchSize);
+            mainNotifyRounds += 1;
+            mainLastNotifiedAtMs = now;
+
+            userUpdates.mainNotifyRounds = mainNotifyRounds;
+            userUpdates.mainLastNotifiedAt = FieldValue.serverTimestamp();
+          }
+        }
+
+        // After X push rounds → place call to main user (your desired behavior)
+        if (
+          mainNotifyRounds >= mainCfg.pushThenCallCount &&
+          !mainCallPlaced &&
+          mainUserPhone &&
+          appId
+        ) {
+          const clientState = Buffer.from(
+            JSON.stringify({
+              mainUserUid,
+              emergencyContactUid: null,
+              reason: "main_user_missed_checkin",
+            })
+          ).toString("base64");
+
+          await axios.post(
+            `${TELNYX_API}/calls`,
+            {
+              connection_id: appId,
+              to: mainUserPhone,
+              from,
+              client_state: clientState,
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+              },
+            }
+          );
+
+          mainCallPlaced = true;
+          userUpdates.mainCallPlaced = true;
+          telnyxCallsQueued++;
+        }
+      }
+    }
+
+    // ----------------------------
+    // STEP 2: Escalate to EC after
+    //         3 main rounds / 30 min
+    //         or EC custom delay
+    // ----------------------------
+
+    // Determine primary ACTIVE EC
+    const activeContacts = await getActiveEmergencyContacts(mainUserUid);
+    const primaryEc = activeContacts[0];
+
+    if (primaryEc && primaryEc.phone && isE164(primaryEc.phone)) {
+      const ecCfg = resolveEcNotificationConfig(primaryEc);
+      const ecPhone = String(primaryEc.phone);
+      const emergencyContactUid = primaryEc.emergencyContactUid || null;
+
+      // When should escalation begin?
+      const escalationShouldStart =
+        elapsedMin >= ecCfg.escalationDelayMin ||
+        mainNotifyRounds >= 3; // 3 rounds ~ 30 minutes by default
+
+      if (escalationShouldStart) {
+        const ecMinutesSinceLastPush = ecLastNotifiedAtMs
+          ? (now - ecLastNotifiedAtMs) / 60_000
+          : Infinity;
+
+        // Helper to send push batch to EC(s)
+        const sendPushBatchToEmergencyContacts = async (
+          batchSize: number
+        ) => {
+          const ecUids = await getActiveEmergencyContactUids(mainUserUid);
+          if (!ecUids.length) return;
+
+          const allTokens = (
+            await Promise.all(ecUids.map((id) => getFcmTokensForUser(id)))
+          ).flat();
+
+          if (!allTokens.length) return;
+
+          for (let i = 0; i < batchSize; i++) {
+            await sendPushToTokens(
+              allTokens,
+              {
+                title: "Life Signal: missed check-in",
+                body: `${mainUserName} missed a check-in. Please check on them and acknowledge the alert.`,
+              },
+              {
+                type: "escalation_emergency_contact",
+                mainUserUid,
+              }
+            );
+          }
+        };
+
+        if (ecCfg.mode === "CALL_ONLY") {
+          // Call immediately once escalation starts
+          if (!ecCallPlaced && appId) {
+            const clientState = Buffer.from(
+              JSON.stringify({
+                mainUserUid,
+                emergencyContactUid,
+                reason: "escalation",
+              })
+            ).toString("base64");
+
+            await axios.post(
+              `${TELNYX_API}/calls`,
+              {
+                connection_id: appId,
+                to: ecPhone,
+                from,
+                client_state: clientState,
+              },
+              {
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Type": "application/json",
+                },
+              }
+            );
+
+            ecCallPlaced = true;
+            userUpdates.ecCallPlaced = true;
+            telnyxCallsQueued++;
+          }
+        } else if (ecCfg.mode === "PUSH_ONLY") {
+          // Push every pushIntervalMin until the main user has checked in again
+          if (
+            ecMinutesSinceLastPush >= ecCfg.pushIntervalMin ||
+            ecNotifyRounds === 0
+          ) {
+            await sendPushBatchToEmergencyContacts(ecCfg.pushBatchSize);
+            ecNotifyRounds += 1;
+            ecLastNotifiedAtMs = now;
+            userUpdates.ecNotifyRounds = ecNotifyRounds;
+            userUpdates.ecLastNotifiedAt = FieldValue.serverTimestamp();
+          }
+        } else {
+          // PUSH_PLUS_CALL for EC
+          if (
+            ecMinutesSinceLastPush >= ecCfg.pushIntervalMin ||
+            ecNotifyRounds === 0
+          ) {
+            await sendPushBatchToEmergencyContacts(ecCfg.pushBatchSize);
+            ecNotifyRounds += 1;
+            ecLastNotifiedAtMs = now;
+            userUpdates.ecNotifyRounds = ecNotifyRounds;
+            userUpdates.ecLastNotifiedAt = FieldValue.serverTimestamp();
+          }
+
+          if (!ecCallPlaced && elapsedMin >= ecCfg.callDelayMin && appId) {
+            const clientState = Buffer.from(
+              JSON.stringify({
+                mainUserUid,
+                emergencyContactUid,
+                reason: "escalation",
+              })
+            ).toString("base64");
+
+            await axios.post(
+              `${TELNYX_API}/calls`,
+              {
+                connection_id: appId,
+                to: ecPhone,
+                from,
+                client_state: clientState,
+              },
+              {
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Type": "application/json",
+                },
+              }
+            );
+
+            ecCallPlaced = true;
+            userUpdates.ecCallPlaced = true;
+            telnyxCallsQueued++;
+          }
+        }
+      }
+    } else {
+      logger.warn("No ACTIVE emergency contact with valid E.164 phone", {
         mainUserUid,
-        emergencyContactUid,
-        contactPhone: String(contactPhone),
-        stage: "waiting_for_call",
-        nextActionAt, // Firestore Timestamp/Date
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
       });
     }
 
-    processed.push(mainUserUid);
+    if (Object.keys(userUpdates).length > 0) {
+      await userRef.set(userUpdates, { merge: true });
+      processed.push(mainUserUid);
+    }
   }
 
-  // Perform scheduled call stage
-  const dueEsc = await db
-    .collection("escalations")
-    .where("stage", "==", "waiting_for_call")
-    .where("nextActionAt", "<=", new Date())
-    .limit(50)
-    .get();
-
-  for (const eDoc of dueEsc.docs) {
-    const e = eDoc.data() as any;
-
-    const to = String(e.contactPhone || "");
-    const from = S_TELNYX_FROM_NUMBER.value() || process.env.TELNYX_FROM_NUMBER;
-    const connectionId = S_TELNYX_APPLICATION_ID.value() || process.env.TELNYX_APPLICATION_ID;
-    const apiKey = S_TELNYX_API_KEY.value() || process.env.TELNYX_API_KEY;
-
-    if (!isE164(to)) {
-      logger.warn("Skipping escalation with non-E.164 phone", { to, id: eDoc.id });
-      await eDoc.ref.set(
-        { stage: "error", lastError: "Invalid E.164 phone", updatedAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
-      continue;
-    }
-    if (!connectionId || !apiKey) {
-      logger.error("Missing Telnyx config; cannot place call");
-      continue;
-    }
-
-    const clientState = Buffer
-      .from(JSON.stringify({
-        mainUserUid: e.mainUserUid,
-        emergencyContactUid: e.emergencyContactUid || null,
-        reason: "escalation",
-      }))
-      .toString("base64");
-
-    await axios.post(
-      `${TELNYX_API}/calls`,
-      {
-        connection_id: connectionId,
-        to,
-        from,
-        client_state: clientState,
-      },
-      {
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    await eDoc.ref.set(
-      { stage: "called", updatedAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-  }
+  const escalationsQueued = telnyxCallsQueued;
 
   return {
     processed,
+    telnyxCallsQueued,
     escalationsQueued,
-    dueEscProcessed: dueEsc.size,
+    dueEscProcessed: 0,
   };
 }
 
@@ -679,11 +850,16 @@ async function runEscalationScanJob(input: { cooldownMin?: number } = {}) {
  *  HTTP endpoint — manual/automation trigger of the job
  *  ------------------------------------------------------ */
 export const runEscalationScan = onRequest(
-  { secrets: [S_TELNYX_API_KEY, S_TELNYX_APPLICATION_ID, S_TELNYX_FROM_NUMBER] },
+  {
+    region: "us-central1",
+    secrets: [S_TELNYX_API_KEY, S_TELNYX_APPLICATION_ID, S_TELNYX_FROM_NUMBER],
+  },
   async (req, res) => {
     try {
-      const out = await runEscalationScanJob(req.body || {});
-      res.json({ ok: true, ...out });
+      const cooldownMin = Number(req.query.cooldownMin ?? 10);
+      const out = await runEscalationScanJob({ cooldownMin });
+      logger.info("runEscalationScan summary", out);
+      res.status(200).json({ ok: true, ...out });
     } catch (err: any) {
       logger.error("runEscalationScan HTTP error", err?.message);
       res.status(500).json({ ok: false, error: err?.message });

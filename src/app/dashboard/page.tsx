@@ -1,8 +1,21 @@
 // src/app/dashboard/page.tsx
-"use client"; // ➊ Mark this file as a client component (uses browser APIs/hooks)
+// This file implements the main dashboard page for the LifeSignal AI application.
+// It serves as the central hub for the primary user, providing features like:
+// - SOS triggering
+// - Manual check-ins and setting check-in intervals
+// - Monitoring check-in status (Safe, Missed)
+// - Managing location sharing consent and status
+// - Interacting with Emergency Contacts (calling, sending voice messages)
+// - Accessing the AI assistant
+// - Updating personal phone number
+// It uses Firebase (Auth, Firestore) for data and authentication, and Shadcn UI for components.
+// It also integrates with browser APIs for geolocation and push notifications.
+"use client"; // Client component so we can use hooks, browser APIs
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"; // ➋ React + hooks
-import { // ➌ Firestore functions used for realtime and updates
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// --- Firestore (realtime + updates used elsewhere on the page) ---
+import {
   onSnapshot,
   doc,
   Timestamp,
@@ -10,78 +23,100 @@ import { // ➌ Firestore functions used for realtime and updates
   updateDoc,
   serverTimestamp,
   deleteField,
+  Firestore,
 } from "firebase/firestore";
-import { onAuthStateChanged } from "firebase/auth"; // ➍ Auth state observer
-import { useRouter } from "next/navigation"; // ➎ Router (App Router)
-import { auth, db } from "@/firebase"; // ➏ Client Firebase (Auth + Firestore)
+// --- Firestore (query helpers used for latest contact voice message in dialog) ---
+import { collection, getDocs, limit, orderBy, query as fsQuery } from "firebase/firestore";
 
-import { Header } from "@/components/header"; // ➐ Top nav
-import { Footer } from "@/components/footer"; // ➑ Footer
-import { VoiceCheckIn } from "@/components/voice-check-in"; // ➒ Voice recording widget
-import { AskAiAssistant } from "@/components/ask-ai-assistant"; // ➓ Ask-AI widget
-import { EmergencyContacts } from "@/components/emergency-contact"; // ⓫ EC panel
-import { useSosDialer } from "@/hooks/useSosDialer"; // ⓬ Press-and-hold SOS dialer
-import { // ⓭ Emergency numbers lookup
+import { onAuthStateChanged } from "firebase/auth";
+import { useRouter } from "next/navigation";
+import { auth, db } from "@/firebase";
+
+import { Header } from "@/components/header";
+import { Footer } from "@/components/footer";
+import { VoiceCheckIn } from "@/components/voice-check-in";
+import { AskAiAssistant } from "@/components/ask-ai-assistant";
+import { EmergencyContacts } from "@/components/emergency-contact";
+import { useSosDialer } from "@/hooks/useSosDialer";
+
+// Emergency services catalog
+import {
   DEFAULT_EMERGENCY_SERVICE_COUNTRY,
   EmergencyServiceCountryCode,
   getEmergencyService,
 } from "@/constants/emergency-services";
 
-// shadcn/ui
-import { Button } from "@/components/ui/button"; // ⓮ Buttons
-import { Input } from "@/components/ui/input"; // ⓯ Input
-import { Label } from "@/components/ui/label"; // ⓰ Label
-import { // ⓱ Card primitives
+// shadcn/ui components
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
   Card,
   CardContent,
   CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { // ⓲ Select primitives
+import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { // ⓳ Dialog primitives
+import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogHeader,
   DialogTitle,
+  DialogClose,
 } from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator"; // ⓴ Divider
-import { useToast } from "@/hooks/use-toast"; // ㉑ Toast notifications
+import { Separator } from "@/components/ui/separator";
+import { useToast } from "@/hooks/use-toast";
 
-// icons
-import { Siren, CheckCircle2, PhoneCall, Clock, Mic } from "lucide-react"; // ㉒ Icons
+// Icons
+import {
+  Siren,
+  CheckCircle2,
+  PhoneCall,
+  Clock,
+  Mic,
+  Mail,
+  Phone,
+  Play,
+  Pause,
+  Settings,
+} from "lucide-react";
 
-// roles
-import { normalizeRole } from "@/lib/roles"; // ㉓ Role alias normalizer
+// Role helper
+import { normalizeRole } from "@/lib/roles";
 
-// push device registration
-import { registerDevice } from "@/lib/useFcmToken"; // ㉔ FCM device registration
-import { isValidE164Phone, sanitizePhone } from "@/lib/phone"; // ㉕ Phone helpers
+// Push device registration
+import { registerDevice } from "@/lib/useFcmToken";
 
-// ㉖ Shape for the embedded emergency contacts block stored on user doc
+// Phone helpers
+import { isValidE164Phone, sanitizePhone } from "@/lib/phone";
+
+// ---- Types for emergency contacts stored on user doc ----
 interface EmergencyContactsData {
   contact1_firstName?: string;
   contact1_lastName?: string;
   contact1_email?: string;
   contact1_phone?: string;
+  contact1_emergencyContactUid?: string;
   emergencyServiceCountry?: EmergencyServiceCountryCode;
   contact2_firstName?: string;
   contact2_lastName?: string;
   contact2_email?: string;
   contact2_phone?: string;
+  contact2_emergencyContactUid?: string;
 }
 
-// ㉗ User document shape (subset)
+// ---- Subset of user doc we consume on this page ----
 interface UserDoc {
   lastCheckinAt?: Timestamp;
-  checkinInterval?: number | string; // minutes
+  checkinInterval?: number | string;
   locationSharing?: boolean;
   sosTriggeredAt?: Timestamp;
   role?: string;
@@ -90,50 +125,71 @@ interface UserDoc {
   missedNotifiedAt?: Timestamp | null;
   emergencyContacts?: EmergencyContactsData;
   phone?: string;
+  // Preferred notification behavior for this user
+  notificationMethod?: "push" | "push_then_call" | "call_immediately";
+  // Delay (in minutes) before calling when using push-then-call
+  pushThenCallDelayMinutes?: number;
+  // Number of push notifications if using "Push Only"
+  pushOnlyCount?: number;
+  // Number of push notifications before calling when using "Push → Then Call"
+  pushThenCallCount?: number;
 }
 
-// ㉘ Local types for UI state
+// ---- Local UI types ----
 type Status = "safe" | "missed" | "unknown";
 type LocationShareReason = "sos" | "escalation";
 
+// Voice quick message target
 type VoiceMessageTarget = {
   name: string;
   email?: string | null;
   phone?: string | null;
 };
 
-// ㉙ Route alias for emergency dashboard (kept aligned with roles)
-const EMERGENCY_DASH = "/emergency-dashboard";
+// Contact dialog types
+type ContactKind = "primary" | "secondary";
+type ContactDialogState = {
+  open: boolean;
+  kind: ContactKind | null;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  uid: string | null;
+};
 
-// ㉚ Helper to compute minutes since epoch for dueAtMin
-const toEpochMinutes = (ms: number) => Math.floor(ms / 60000);
+type LatestVoiceFromContact =
+  | {
+      audioUrl: string;
+      createdAt: Date | null;
+      transcript?: string;
+    }
+  | null;
 
-// ㉛ Selectable check-in hours
-const HOURS_OPTIONS = [1, 2, 3, 6, 10, 12, 18, 24] as const;
-// ㉜ Throttle sharing identical reasons
-const LOCATION_SHARE_COOLDOWN_MS = 60_000;
-// ㉝ Geolocation error codes
+// ---- Routes, helpers, constants ----
+const EMERGENCY_DASH = "/emergency-dashboard"; // Route used if an EC tries to open this page
+const toEpochMinutes = (ms: number) => Math.floor(ms / 60000); // Helper to compute dueAtMin
+
+const HOURS_OPTIONS = [1, 2, 3, 6, 10, 12, 18, 24] as const; // Allowed check-in intervals (hrs)
+const LOCATION_SHARE_COOLDOWN_MS = 60_000; // Throttle repeated shares
 const GEO_PERMISSION_DENIED = 1;
 const GEO_POSITION_UNAVAILABLE = 2;
 const GEO_TIMEOUT = 3;
 
-// ㉞ Base classes used by most primary cards
-//     - add `overflow-hidden` so inner elements never spill outside on resize
-//     - remove hard aspect locking on small screens to avoid tall cards
+// ---- Normalizers ----
+const normalizeEmail = (value?: string | null) =>
+  typeof value === "string" ? value.trim().toLowerCase() : "";
+
+// ---- Styling tokens ----
 const PRIMARY_CARD_BASE_CLASSES =
   "flex overflow-hidden min-h-[18rem] flex-col shadow-lg transition-shadow hover:shadow-xl";
-// ㉟ Shared header text styles
 const PRIMARY_CARD_HEADER_CLASSES = "space-y-3 text-center";
-// ㊱ Large title style
 const PRIMARY_CARD_TITLE_CLASSES = "text-3xl font-headline font-semibold";
-// ㊲ Description style
 const PRIMARY_CARD_DESCRIPTION_CLASSES = "text-lg text-muted-foreground";
 
-// ㊳ Convert Geolocation errors to friendly copy
+// ---- Map Geolocation errors to friendly text ----
 function describeGeoError(error: unknown) {
   const defaultMessage =
     "We couldn't access your current location. Please enable location services and try again.";
-
   if (!error || typeof error !== "object") return defaultMessage;
 
   const maybeGeo = error as { code?: number; message?: string };
@@ -145,84 +201,76 @@ function describeGeoError(error: unknown) {
         return "Your device couldn't determine your location. Try moving somewhere with a clearer signal and try again.";
       case GEO_TIMEOUT:
         return "Locating you took too long. Try again from an area with better reception.";
-      default:
-        break;
     }
   }
-
-  if (typeof maybeGeo.message === "string" && maybeGeo.message.trim().length > 0) {
-    return maybeGeo.message;
-  }
-
+  if (typeof maybeGeo.message === "string" && maybeGeo.message.trim()) return maybeGeo.message;
   return defaultMessage;
 }
 
-/**
- * ㊴ Check geolocation permission without prompting.
- *     Returns true | "prompt" | false
- */
+// ---- Check browser permission without prompting ----
 async function ensureGeoAllowed(): Promise<true | false | "prompt"> {
-  if (typeof window === "undefined") return false; // SSR guard
-  if (!("geolocation" in navigator)) return false; // API missing
+  if (typeof window === "undefined") return false;
+  if (!("geolocation" in navigator)) return false;
 
   const navAny = navigator as any;
   if (!navAny.permissions?.query) return true; // No Permissions API → assume ok
-
   try {
-    const status: PermissionStatus = await navAny.permissions.query(
-      { name: "geolocation" as PermissionName }
-    );
-    if (status.state === "granted") return true; // granted
-    if (status.state === "prompt") return "prompt"; // will prompt on call
-    return false; // denied
+    const status: PermissionStatus = await navAny.permissions.query({
+      name: "geolocation" as any,
+    });
+    if (status.state === "granted") return true;
+    if (status.state === "prompt") return "prompt";
+    return false;
   } catch {
-    return true; // fail-open to avoid blocking
+    return true;
   }
 }
 
-/** ㊵ Call your Cloud Function via a Next.js proxy (hides origin + CORS). */
+// ---- Helper to call your server to place Telnyx call ----
 async function triggerServerTelnyxCall(params: {
-  to?: string;                 // optional; omit to let server look up ACTIVE EC
+  to?: string;
   mainUserUid?: string;
   emergencyContactUid?: string;
 }) {
-  const url = "/api/sos/call-server"; // Proxy endpoint
-
-  // Try to attach a Firebase ID token for server verification (optional).
+  const url = "/api/sos/call-server";
   let authHeader: Record<string, string> = {};
   try {
     const token = await auth.currentUser?.getIdToken();
     if (token) authHeader = { Authorization: `Bearer ${token}` };
-  } catch {
-    /* non-fatal */
-  }
-
+  } catch {}
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeader },
     body: JSON.stringify({ reason: "sos", ...params }),
     cache: "no-store",
   });
-
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data?.ok) {
-    throw new Error(data?.error || "Server failed to place Telnyx call");
-  }
+  if (!res.ok || !data?.ok) throw new Error(data?.error || "Server failed to place Telnyx call");
   return data;
 }
 
-// ㊶ Main page component
+// ======================= PAGE =======================
 export default function DashboardPage() {
-  const router = useRouter(); // ㊷ Router for redirects
-  const { toast } = useToast(); // ㊸ Toast API
 
-  // ㊹ User state (check-in)
+  // For scrolling to App Settings section
+const settingsRef = useRef<HTMLDivElement | null>(null);
+
+const scrollToSettings = () => {
+  settingsRef.current?.scrollIntoView({
+    behavior: "smooth",
+    block: "start",
+  });
+};
+  const router = useRouter();
+  const { toast } = useToast();
+
+  // ---- Check-in state ----
   const [lastCheckIn, setLastCheckIn] = useState<Date | null>(null);
-  const [intervalMinutes, setIntervalMinutes] = useState<number>(12 * 60); // default 12h
+  const [intervalMinutes, setIntervalMinutes] = useState<number>(12 * 60);
   const [status, setStatus] = useState<Status>("unknown");
   const [timeLeft, setTimeLeft] = useState<string>("");
 
-  // ㊺ Location sharing state
+  // ---- Location sharing state ----
   const [locationSharing, setLocationSharing] = useState<boolean | null>(null);
   const [locationShareReason, setLocationShareReason] = useState<LocationShareReason | null>(null);
   const [locationSharedAt, setLocationSharedAt] = useState<Date | null>(null);
@@ -231,57 +279,70 @@ export default function DashboardPage() {
   const [clearingLocation, setClearingLocation] = useState(false);
   const [sharingLocation, setSharingLocation] = useState(false);
 
-  // ㊻ Auth/role state
+  // ---- Auth + role gate ----
   const [roleChecked, setRoleChecked] = useState(false);
   const [userDocLoaded, setUserDocLoaded] = useState(false);
 
-  // ㊼ Emergency service + contacts state
+  // ---- Emergency service + contacts shown on the page ----
   const [emergencyServiceCountry, setEmergencyServiceCountry] =
     useState<EmergencyServiceCountryCode>(DEFAULT_EMERGENCY_SERVICE_COUNTRY);
-  const [primaryEmergencyContactPhone, setPrimaryEmergencyContactPhone] =
-    useState<string | null>(null);
-  const [primaryEmergencyContactEmail, setPrimaryEmergencyContactEmail] =
-    useState<string | null>(null);
-  const [primaryEmergencyContactName, setPrimaryEmergencyContactName] =
-    useState<string>("Emergency Contact 1");
-  const [secondaryEmergencyContactPhone, setSecondaryEmergencyContactPhone] =
-    useState<string | null>(null);
-  const [secondaryEmergencyContactEmail, setSecondaryEmergencyContactEmail] =
-    useState<string | null>(null);
-  const [secondaryEmergencyContactName, setSecondaryEmergencyContactName] =
-    useState<string>("Emergency Contact 2");
+  const [primaryEmergencyContactPhone, setPrimaryEmergencyContactPhone] = useState<string | null>(null);
+  const [primaryEmergencyContactEmail, setPrimaryEmergencyContactEmail] = useState<string | null>(null);
+  const [primaryEmergencyContactUid, setPrimaryEmergencyContactUid] = useState<string | null>(null);
+  const [primaryEmergencyContactName, setPrimaryEmergencyContactName] = useState<string>("Emergency Contact 1");
+  const [secondaryEmergencyContactPhone, setSecondaryEmergencyContactPhone] = useState<string | null>(null);
+  const [secondaryEmergencyContactEmail, setSecondaryEmergencyContactEmail] = useState<string | null>(null);
+  const [secondaryEmergencyContactUid, setSecondaryEmergencyContactUid] = useState<string | null>(null);
+  const [secondaryEmergencyContactName, setSecondaryEmergencyContactName] = useState<string>("Emergency Contact 2");
 
-  // ㊽ Phone settings
+  // ---- Main user's own phone field (right column settings) ----
   const [savedPhone, setSavedPhone] = useState<string>("");
   const [phoneDraft, setPhoneDraft] = useState<string>("");
   const [phoneSaving, setPhoneSaving] = useState(false);
 
-  // ㊾ Voice quick message target/dialog
-  const [voiceMessageTarget, setVoiceMessageTarget] =
-    useState<VoiceMessageTarget | null>(null);
+  // User's preferred alert method (push, push-then-call, or call immediately)
+  const [notificationMethod, setNotificationMethod] = useState<string>("push"); 
+  // Delay (in minutes) before calling when using push-then-call
+  const [pushThenCallDelayMinutes, setPushThenCallDelayMinutes] = useState<number>(1); 
+  // Number of push notifications to send when the user selects "Push Only"
+  const [pushOnlyCount, setPushOnlyCount] = useState<number>(3);
+  // Number of push notifications to send before calling when "Push → Then Call" is selected
+  const [pushThenCallCount, setPushThenCallCount] = useState<number>(3);
+
+  // ---- Voice quick message dialog (top of page) ----
+  const [voiceMessageTarget, setVoiceMessageTarget] = useState<VoiceMessageTarget | null>(null);
   const [quickVoiceDialogOpen, setQuickVoiceDialogOpen] = useState(false);
 
-  // ㊿ Main user UID (for downstream calls)
+  // ---- IDs & Refs ----
   const [mainUserUid, setMainUserUid] = useState<string | null>(null);
-
-  // 51 Refs to manage subscriptions/throttles
   const userDocUnsubRef = useRef<(() => void) | null>(null);
   const userRef = useRef<ReturnType<typeof doc> | null>(null);
   const autoCheckInTriggeredRef = useRef(false);
   const lastLocationShareRef = useRef<{ reason: LocationShareReason; ts: number } | null>(null);
   const prevEscalationActiveRef = useRef(false);
 
-  // 52 Foreground push notifications while app is open
+  // ---- Contact Dialog (tiles → pop-out) ----
+  const [contactDialog, setContactDialog] = useState<ContactDialogState>({
+    open: false,
+    kind: null,
+    name: "",
+    phone: null,
+    email: null,
+    uid: null,
+  });
+  const [latestVoiceFromContact, setLatestVoiceFromContact] = useState<LatestVoiceFromContact>(null);
+  const latestAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlayingLatest, setIsPlayingLatest] = useState(false);
+
+  // ---- Foreground push notifications ----
   useEffect(() => {
     let unsub: (() => void) | undefined;
-
     (async () => {
       const { isSupported, getMessaging, onMessage } = await import("firebase/messaging");
-      if (!(await isSupported())) return; // Skip if unsupported
-
+      if (!(await isSupported())) return;
       const { initializeApp, getApps } = await import("firebase/app");
       const apps = getApps();
-      const app = apps.length // Reuse existing client app or init a lightweight one
+      const app = apps.length
         ? apps[0]
         : initializeApp({
             apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
@@ -290,10 +351,7 @@ export default function DashboardPage() {
             messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID!,
             appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID!,
           });
-
       const messaging = getMessaging(app);
-
-      // Listen to foreground messages and show native notifications
       unsub = onMessage(messaging, async (payload) => {
         const reg = await navigator.serviceWorker.ready;
         const title = payload.notification?.title || payload.data?.title || "Notification";
@@ -302,20 +360,17 @@ export default function DashboardPage() {
         reg.showNotification(title, { body, data: { url } });
       });
     })();
-
-    return () => unsub?.(); // Cleanup listener
+    return () => unsub?.();
   }, []);
 
-  // 53 Auth + user document subscription (role gate + user state)
+  // ---- Auth + user doc subscription (role-gated) ----
   useEffect(() => {
     const offAuth = onAuthStateChanged(auth, async (user) => {
-      // Stop previous Firestore subscription, if any
-      if (userDocUnsubRef.current) {
-        userDocUnsubRef.current();
-        userDocUnsubRef.current = null;
-      }
+      // Cleanup previous doc listener
+      userDocUnsubRef.current?.();
+      userDocUnsubRef.current = null;
 
-      // If signed out → reset local state
+      // Signed out → reset local state
       if (!user) {
         userRef.current = null;
         setMainUserUid(null);
@@ -333,22 +388,26 @@ export default function DashboardPage() {
         setPrimaryEmergencyContactName("Emergency Contact 1");
         setPrimaryEmergencyContactPhone(null);
         setPrimaryEmergencyContactEmail(null);
+        setPrimaryEmergencyContactUid(null);
         setSecondaryEmergencyContactName("Emergency Contact 2");
         setSecondaryEmergencyContactPhone(null);
         setSecondaryEmergencyContactEmail(null);
+        setSecondaryEmergencyContactUid(null);
         setVoiceMessageTarget(null);
         return;
       }
 
-      // When signed in → subscribe to user doc
+      // Signed in → subscribe to user doc
       setMainUserUid(user.uid);
       const uref = doc(db, "users", user.uid);
       userRef.current = uref;
       setUserDocLoaded(false);
       autoCheckInTriggeredRef.current = false;
 
-      await setDoc(uref, { createdAt: serverTimestamp() }, { merge: true }); // ensure doc exists
+      // Ensure doc exists
+      await setDoc(uref, { createdAt: serverTimestamp() }, { merge: true });
 
+      // Realtime subscription
       const unsub = onSnapshot(uref, (snap) => {
         if (!snap.exists()) {
           setRoleChecked(true);
@@ -356,182 +415,249 @@ export default function DashboardPage() {
           return;
         }
         const data = snap.data() as UserDoc;
-
-        setRoleChecked(true); // mark before possible redirect to avoid flicker
-
-        // Role gate: emergency contacts should not see this dashboard
+      
+        // Role gate
+        setRoleChecked(true);
         const r = normalizeRole(data.role);
         if (r === "emergency_contact") {
           router.replace(EMERGENCY_DASH);
           return;
         }
 
-        // Check-in state
-        if (data.lastCheckinAt instanceof Timestamp) {
-          setLastCheckIn(data.lastCheckinAt.toDate());
+        // Notification settings
+        if (typeof data.notificationMethod === "string") {
+          setNotificationMethod(data.notificationMethod);
         } else {
-          setLastCheckIn(null);
+         setNotificationMethod("push");
         }
 
-        // Interval parsing (string or number)
+        if (typeof data.pushThenCallDelayMinutes === "number") {
+          setPushThenCallDelayMinutes(data.pushThenCallDelayMinutes);
+        } else {
+          setPushThenCallDelayMinutes(1);
+        }
+
+        // Load user's Push Only count from Firestore (fallback to 3 if unset)
+        if (typeof data.pushOnlyCount === "number") {
+          setPushOnlyCount(data.pushOnlyCount);
+        } else {
+          setPushOnlyCount(3);
+        }
+
+        // Load user's Push → Then Call count from Firestore (fallback to 3 if unset)
+        if (typeof data.pushThenCallCount === "number") {
+          setPushThenCallCount(data.pushThenCallCount);
+        } else {
+           setPushThenCallCount(3);
+        }
+
+        // Check-in state
+        setLastCheckIn(data.lastCheckinAt instanceof Timestamp ? data.lastCheckinAt.toDate() : null);
+
+        // Interval
         const rawInt = data.checkinInterval;
         const parsed =
-          typeof rawInt === "string"
-            ? parseInt(rawInt, 10)
-            : typeof rawInt === "number"
-            ? rawInt
-            : NaN;
+          typeof rawInt === "string" ? parseInt(rawInt, 10) : typeof rawInt === "number" ? rawInt : NaN;
         if (!Number.isNaN(parsed) && parsed > 0) setIntervalMinutes(parsed);
 
         // Location consent
-        if (typeof data.locationSharing === "boolean") {
-          setLocationSharing(data.locationSharing);
-        }
+        setLocationSharing(typeof data.locationSharing === "boolean" ? data.locationSharing : null);
 
-        // Last share reason
+        // Share reason + timestamps
         const shareReason = data.locationShareReason;
-        if (shareReason === "sos" || shareReason === "escalation") {
-          setLocationShareReason(shareReason);
-        } else {
-          setLocationShareReason(null);
-        }
+        setLocationShareReason(shareReason === "sos" || shareReason === "escalation" ? shareReason : null);
+        setLocationSharedAt(
+          data.locationSharedAt instanceof Timestamp ? data.locationSharedAt.toDate() : null,
+        );
+        setEscalationActiveAt(
+          data.missedNotifiedAt instanceof Timestamp ? data.missedNotifiedAt.toDate() : null,
+        );
 
-        // Timestamps to Date
-        if (data.locationSharedAt instanceof Timestamp) {
-          setLocationSharedAt(data.locationSharedAt.toDate());
-        } else {
-          setLocationSharedAt(null);
-        }
+        // Phone field (right column)
+        const storedPhone = typeof data.phone === "string" ? sanitizePhone(data.phone) : "";
+        setPhoneDraft((prev) => {
+          const prevSan = sanitizePhone(prev);
+          if (!prevSan) return storedPhone; // empty → load from DB
+          if (prevSan === storedPhone) return storedPhone; // same → keep normalized
+          return prev; // otherwise preserve local edits
+        });
+        setSavedPhone(storedPhone);
 
-        if (data.missedNotifiedAt instanceof Timestamp) {
-          setEscalationActiveAt(data.missedNotifiedAt.toDate());
-        } else {
-          setEscalationActiveAt(null);
-        }
-
-        // Phone field
-        const storedPhone =
-          typeof data.phone === "string" ? sanitizePhone(data.phone) : "";
-          setPhoneDraft((prev) => {
-            const prevSan = sanitizePhone(prev);
-            // If the field is empty on load, populate from DB
-            if (!prevSan) return storedPhone;
-            // If it already matches DB (e.g., after save), normalize it
-            if (prevSan === storedPhone) return storedPhone;
-            // Otherwise, preserve the user's unsaved local edits
-            return prev;
-          });
-
-        // Emergency contacts snapshot → extract key fields
-        const contacts = data.emergencyContacts as EmergencyContactsData | undefined;
+        // Emergency contacts block
+        const contacts = data.emergencyContacts;
         if (contacts) {
           const service = getEmergencyService(contacts.emergencyServiceCountry);
           setEmergencyServiceCountry(service.code);
 
-          const first =
-            typeof contacts.contact1_firstName === "string"
-              ? contacts.contact1_firstName.trim()
-              : "";
-          const last =
-            typeof contacts.contact1_lastName === "string"
-              ? contacts.contact1_lastName.trim()
-              : "";
-          const displayName = [first, last].filter(Boolean).join(" ");
-          setPrimaryEmergencyContactName(displayName || "Emergency Contact 1");
-
-          const phone =
-            typeof contacts.contact1_phone === "string"
-              ? sanitizePhone(contacts.contact1_phone)
-              : "";
-          setPrimaryEmergencyContactPhone(phone || null);
-          const email =
+          const first = (contacts.contact1_firstName || "").trim();
+          const last = (contacts.contact1_lastName || "").trim();
+          setPrimaryEmergencyContactName([first, last].filter(Boolean).join(" ") || "Emergency Contact 1");
+          setPrimaryEmergencyContactPhone(
+            contacts.contact1_phone ? sanitizePhone(contacts.contact1_phone) || null : null,
+          );
+          const primaryEmailRaw =
             typeof contacts.contact1_email === "string"
               ? contacts.contact1_email.trim()
               : "";
-          setPrimaryEmergencyContactEmail(email || null);
+          setPrimaryEmergencyContactEmail(primaryEmailRaw || null);
+          const primaryUidRaw =
+            typeof contacts.contact1_emergencyContactUid === "string"
+              ? contacts.contact1_emergencyContactUid.trim()
+              : "";
+          setPrimaryEmergencyContactUid(primaryUidRaw || null);
 
-          const secondFirst =
-            typeof contacts.contact2_firstName === "string"
-              ? contacts.contact2_firstName.trim()
-              : "";
-          const secondLast =
-            typeof contacts.contact2_lastName === "string"
-              ? contacts.contact2_lastName.trim()
-              : "";
-          const secondDisplayName = [secondFirst, secondLast].filter(Boolean).join(" ");
+          const first2 = (contacts.contact2_firstName || "").trim();
+          const last2 = (contacts.contact2_lastName || "").trim();
           setSecondaryEmergencyContactName(
-            secondDisplayName || "Emergency Contact 2"
+            [first2, last2].filter(Boolean).join(" ") || "Emergency Contact 2",
           );
-
-          const secondPhone =
-            typeof contacts.contact2_phone === "string"
-              ? sanitizePhone(contacts.contact2_phone)
-              : "";
-          setSecondaryEmergencyContactPhone(secondPhone || null);
-          const secondEmail =
+          setSecondaryEmergencyContactPhone(
+            contacts.contact2_phone ? sanitizePhone(contacts.contact2_phone) || null : null,
+          );
+          const secondaryEmailRaw =
             typeof contacts.contact2_email === "string"
               ? contacts.contact2_email.trim()
               : "";
-          setSecondaryEmergencyContactEmail(secondEmail || null);
+          setSecondaryEmergencyContactEmail(secondaryEmailRaw || null);
+          const secondaryUidRaw =
+            typeof contacts.contact2_emergencyContactUid === "string"
+              ? contacts.contact2_emergencyContactUid.trim()
+              : "";
+          setSecondaryEmergencyContactUid(secondaryUidRaw || null);
         } else {
-          // Reset when no contacts populated
+          // Reset when empty
           setEmergencyServiceCountry(DEFAULT_EMERGENCY_SERVICE_COUNTRY);
           setPrimaryEmergencyContactName("Emergency Contact 1");
           setPrimaryEmergencyContactPhone(null);
           setPrimaryEmergencyContactEmail(null);
+          setPrimaryEmergencyContactUid(null);
           setSecondaryEmergencyContactName("Emergency Contact 2");
           setSecondaryEmergencyContactPhone(null);
           setSecondaryEmergencyContactEmail(null);
+          setSecondaryEmergencyContactUid(null);
         }
 
-        setUserDocLoaded(true); // mark loaded
+        setUserDocLoaded(true);
       });
 
       userDocUnsubRef.current = unsub;
     });
 
     return () => {
-      offAuth(); // stop auth observer
-      if (userDocUnsubRef.current) {
-        userDocUnsubRef.current();
-        userDocUnsubRef.current = null;
-      }
+      offAuth();
+      userDocUnsubRef.current?.();
+      userDocUnsubRef.current = null;
     };
   }, [router]);
 
-  // 54 Register device for push when we know we’re the main user
+  // ---- Register device for push (main user only) ----
   useEffect(() => {
     if (!roleChecked || !mainUserUid) return;
     registerDevice(mainUserUid, "primary");
   }, [roleChecked, mainUserUid]);
 
-  // 55 Compute next scheduled check-in from last + interval
+  // ---- Ensure we know each contact's emergencyContactUid ----
+  useEffect(() => {
+    if (!mainUserUid) return;
+    if (
+      (primaryEmergencyContactUid || !primaryEmergencyContactEmail) &&
+      (secondaryEmergencyContactUid || !secondaryEmergencyContactEmail)
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDocs(collection(db, `users/${mainUserUid}/emergency_contact`));
+        if (cancelled) return;
+
+        let resolvedPrimaryUid = primaryEmergencyContactUid || "";
+        let resolvedSecondaryUid = secondaryEmergencyContactUid || "";
+        const primaryEmailNorm = normalizeEmail(primaryEmergencyContactEmail);
+        const secondaryEmailNorm = normalizeEmail(secondaryEmergencyContactEmail);
+
+        snap.docs.forEach((docSnap) => {
+          const data = docSnap.data() as any;
+          const candidateUid =
+            typeof data?.emergencyContactUid === "string" && data.emergencyContactUid.trim()
+              ? data.emergencyContactUid.trim()
+              : docSnap.id;
+          const relation =
+            typeof data?.relation === "string"
+              ? data.relation.trim().toLowerCase()
+              : "";
+          const docEmailNorm = normalizeEmail(data?.emergencyContactEmail);
+
+          if (!resolvedPrimaryUid) {
+            if (relation === "primary") {
+              resolvedPrimaryUid = candidateUid;
+            } else if (primaryEmailNorm && docEmailNorm && docEmailNorm === primaryEmailNorm) {
+              resolvedPrimaryUid = candidateUid;
+            }
+          }
+
+          if (!resolvedSecondaryUid) {
+            if (relation === "secondary") {
+              resolvedSecondaryUid = candidateUid;
+            } else if (
+              secondaryEmailNorm &&
+              docEmailNorm &&
+              docEmailNorm === secondaryEmailNorm
+            ) {
+              resolvedSecondaryUid = candidateUid;
+            }
+          }
+        });
+
+        if (resolvedPrimaryUid && resolvedPrimaryUid !== primaryEmergencyContactUid) {
+          setPrimaryEmergencyContactUid(resolvedPrimaryUid);
+        }
+        if (resolvedSecondaryUid && resolvedSecondaryUid !== secondaryEmergencyContactUid) {
+          setSecondaryEmergencyContactUid(resolvedSecondaryUid);
+        }
+      } catch (error) {
+        console.warn("Failed to load emergency contact links", error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    db,
+    mainUserUid,
+    primaryEmergencyContactEmail,
+    primaryEmergencyContactUid,
+    secondaryEmergencyContactEmail,
+    secondaryEmergencyContactUid,
+  ]);
+
+  // ---- Derived: next check-in time ----
   const nextCheckIn = useMemo(() => {
     if (!lastCheckIn) return null;
     return new Date(lastCheckIn.getTime() + intervalMinutes * 60 * 1000);
   }, [lastCheckIn, intervalMinutes]);
 
-  // 56 Emergency service info from selected country
+  // ---- Emergency service selection object ----
   const emergencyService = useMemo(
     () => getEmergencyService(emergencyServiceCountry),
-    [emergencyServiceCountry]
+    [emergencyServiceCountry],
   );
 
-  // 57 Helper to open the dialer for a contact phone
+  // ---- Dial helper ----
   const handleDialEmergencyContact = useCallback((phone: string | null) => {
-    if (!phone) return;
-    if (typeof window === "undefined") return;
+    if (!phone || typeof window === "undefined") return;
     window.location.href = `tel:${phone}`;
   }, []);
 
-  // 58 Countdown timer + status derivation
+  // ---- Countdown + status ----
   useEffect(() => {
     if (!nextCheckIn) {
       setStatus("unknown");
       setTimeLeft("");
       return;
     }
-
     const formatTimeLeft = (ms: number) => {
       const totalSeconds = Math.floor(ms / 1000);
       const hours = Math.floor(totalSeconds / 3600);
@@ -541,7 +667,6 @@ export default function DashboardPage() {
       if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m ${s}s left`;
       return `${minutes}m ${s}s left`;
     };
-
     const tick = () => {
       const now = new Date();
       const diff = nextCheckIn.getTime() - now.getTime();
@@ -554,13 +679,12 @@ export default function DashboardPage() {
         setTimeLeft(formatTimeLeft(clamped));
       }
     };
-
-    tick(); // initial
-    const id = setInterval(tick, 1000); // every second
-    return () => clearInterval(id); // cleanup
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
   }, [nextCheckIn]);
 
-  // 59 Format “when” helper for dates
+  // ---- Date pretty-printer used in several places ----
   const formatWhen = (d: Date | null) => {
     if (!d) return "—";
     const now = new Date();
@@ -568,91 +692,84 @@ export default function DashboardPage() {
       d.getFullYear() === now.getFullYear() &&
       d.getMonth() === now.getMonth() &&
       d.getDate() === now.getDate();
-    const yesterday = new Date(now);
-    yesterday.setDate(now.getDate() - 1);
+    const y = new Date(now);
+    y.setDate(now.getDate() - 1);
     const isYesterday =
-      d.getFullYear() === yesterday.getFullYear() &&
-      d.getMonth() === yesterday.getMonth() &&
-      d.getDate() === yesterday.getDate();
-
+      d.getFullYear() === y.getFullYear() &&
+      d.getMonth() === y.getMonth() &&
+      d.getDate() === y.getDate();
     const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     if (sameDay) return `Today at ${time}`;
     if (isYesterday) return `Yesterday at ${time}`;
     return `${d.toLocaleDateString()} ${time}`;
   };
 
-  // 60 Clear last shared location and reason
+  // ---- Clear last shared location from Firestore ----
   const clearSharedLocation = useCallback(async () => {
     const ref = userRef.current;
     if (!ref) throw new Error("Not signed in");
-
     await updateDoc(ref, {
       location: deleteField(),
       locationShareReason: deleteField(),
       locationSharedAt: deleteField(),
       sosTriggeredAt: deleteField(),
     });
-
     lastLocationShareRef.current = null;
     setLocationShareReason(null);
     setLocationSharedAt(null);
   }, []);
 
-  // 61 Result type for captureLocation
+  // ---- Location capture result type ----
   type CaptureLocationResult =
     | { status: "shared"; location: string }
     | { status: "skipped" }
     | { status: "throttled" };
 
-  // 62 Attempt to capture device location with throttling + permission UX
+  // ---- Try to capture device location (with throttle + permission UX) ----
   const captureLocation = useCallback(
     async (
       reason: LocationShareReason,
-      options: { silentIfDisabled?: boolean } = {}
+      options: { silentIfDisabled?: boolean } = {},
     ): Promise<CaptureLocationResult> => {
       if (locationSharing === false) {
         if (!options.silentIfDisabled) {
           toast({
             title: "Location sharing disabled",
-            description: "Enable location sharing in settings to send your location during SOS alerts.",
+            description:
+              "Enable location sharing in settings to send your location during SOS alerts.",
             variant: "destructive",
           });
         }
         return { status: "skipped" };
       }
-
       if (typeof window === "undefined" || !("geolocation" in navigator)) {
         toast({
           title: "Location unavailable",
           description:
-            "Your device does not support location services. Try another device to share your location.",
+            "Your device does not support location services. Try another device.",
           variant: "destructive",
         });
         return { status: "skipped" };
       }
-
       const perm = await ensureGeoAllowed();
       if (perm === false) {
         toast({
           title: "Location denied in browser",
-          description: "Please enable location access for this site in your browser settings.",
+          description:
+            "Please enable location access for this site in your browser settings.",
           variant: "destructive",
         });
         return { status: "skipped" };
       }
-
       const last = lastLocationShareRef.current;
-      const shouldThrottle =
+      const throttled =
         reason !== "sos" &&
         last &&
         last.reason === reason &&
         Date.now() - last.ts < LOCATION_SHARE_COOLDOWN_MS;
-      if (shouldThrottle) {
-        return { status: "throttled" };
-      }
+      if (throttled) return { status: "throttled" };
 
       setSharingLocation(true);
-
       try {
         const position = await new Promise<GeolocationPosition>((resolve, reject) => {
           navigator.geolocation.getCurrentPosition(resolve, reject, {
@@ -661,10 +778,8 @@ export default function DashboardPage() {
             timeout: 15_000,
           });
         });
-
         const { latitude, longitude } = position.coords;
         const locationString = `${latitude.toFixed(6)},${longitude.toFixed(6)}`;
-
         return { status: "shared", location: locationString };
       } catch (error) {
         toast({
@@ -677,10 +792,10 @@ export default function DashboardPage() {
         setSharingLocation(false);
       }
     },
-    [locationSharing, toast]
+    [locationSharing, toast],
   );
 
-  // 63 Persist a shared location and show toasts
+  // ---- Persist a shared location ----
   const shareLocation = useCallback(
     async (reason: LocationShareReason, opts?: { silentIfDisabled?: boolean }) => {
       const ref = userRef.current;
@@ -692,7 +807,6 @@ export default function DashboardPage() {
         });
         return false;
       }
-
       const result = await captureLocation(reason, opts);
       if (result.status === "throttled") return true;
       if (result.status !== "shared") return false;
@@ -703,11 +817,9 @@ export default function DashboardPage() {
           locationShareReason: reason,
           locationSharedAt: serverTimestamp(),
         });
-
         lastLocationShareRef.current = { reason, ts: Date.now() };
         setLocationShareReason(reason);
         setLocationSharedAt(new Date());
-
         toast({
           title: "Location shared",
           description:
@@ -715,7 +827,6 @@ export default function DashboardPage() {
               ? "We sent your current location with your SOS alert."
               : "We shared your current location with your emergency contacts for this escalation.",
         });
-
         return true;
       } catch (error) {
         toast({
@@ -726,58 +837,48 @@ export default function DashboardPage() {
         return false;
       }
     },
-    [captureLocation, toast]
+    [captureLocation, toast],
   );
 
-  // 64 Enable consent (ensures permission flow first)
+  // ---- Enable/disable location consent ----
   const enableLocationSharing = useCallback(async () => {
     const ref = userRef.current;
-    if (!ref) {
-      toast({
+    if (!ref)
+      return toast({
         title: "Not signed in",
-        description: "Please log in again to update your location preferences.",
+        description: "Please log in again.",
         variant: "destructive",
       });
-      return;
-    }
-
-    if (typeof window === "undefined" || !("geolocation" in navigator)) {
-      toast({
+    if (typeof window === "undefined" || !("geolocation" in navigator))
+      return toast({
         title: "Location unavailable",
-        description:
-          "This device doesn't support location services. Try enabling location on another device.",
+        description: "This device doesn't support location services.",
         variant: "destructive",
       });
-      return;
-    }
 
     setLocationMutationPending(true);
-
     try {
       const perm = await ensureGeoAllowed();
-      if (perm === false) {
-        toast({
+      if (perm === false)
+        return toast({
           title: "Location denied in browser",
-          description: "Enable location access for this site in your browser settings.",
+          description:
+            "Enable location access for this site in your browser settings.",
           variant: "destructive",
         });
-        return;
-      }
-
       if (perm === "prompt") {
-        await new Promise<GeolocationPosition>((resolve, reject) => {
+        await new Promise<GeolocationPosition>((resolve, reject) =>
           navigator.geolocation.getCurrentPosition(resolve, reject, {
             enableHighAccuracy: true,
-            timeout: 15_000,
-          });
-        });
+            timeout: 15000,
+          }),
+        );
       }
-
       await updateDoc(ref, { locationSharing: true });
       setLocationSharing(true);
       toast({
         title: "Location sharing enabled",
-        description: "We only share your location during an SOS alert or escalation.",
+        description: "We only share it during alerts.",
       });
     } catch (error) {
       toast({
@@ -790,20 +891,15 @@ export default function DashboardPage() {
     }
   }, [toast]);
 
-  // 65 Disable consent and clear stored location
   const disableLocationSharing = useCallback(async () => {
     const ref = userRef.current;
-    if (!ref) {
-      toast({
+    if (!ref)
+      return toast({
         title: "Not signed in",
-        description: "Please log in again to update your location preferences.",
+        description: "Please log in again.",
         variant: "destructive",
       });
-      return;
-    }
-
     setLocationMutationPending(true);
-
     try {
       await updateDoc(ref, {
         locationSharing: false,
@@ -811,15 +907,13 @@ export default function DashboardPage() {
         locationShareReason: deleteField(),
         locationSharedAt: deleteField(),
       });
-
       lastLocationShareRef.current = null;
       setLocationSharing(false);
       setLocationShareReason(null);
       setLocationSharedAt(null);
-
       toast({
         title: "Location sharing disabled",
-        description: "We turned off location sharing and cleared the last shared location.",
+        description: "Cleared the last shared location.",
       });
     } catch (error: any) {
       toast({
@@ -832,16 +926,14 @@ export default function DashboardPage() {
     }
   }, [toast]);
 
-  // 66 Clear last shared location action
   const handleClearSharedLocation = useCallback(async () => {
     if (!locationShareReason) return;
-
     setClearingLocation(true);
     try {
       await clearSharedLocation();
       toast({
         title: "Location cleared",
-        description: "We removed your last shared location from the emergency dashboard.",
+        description: "Removed from the emergency dashboard.",
       });
     } catch (error: any) {
       toast({
@@ -854,36 +946,31 @@ export default function DashboardPage() {
     }
   }, [clearSharedLocation, locationShareReason, toast]);
 
-  // 67 SOS flow (capture location → record → server call)
+  // ---- SOS flow ----
   const triggerSos = useCallback(async () => {
     const ref = userRef.current;
-    if (!ref) {
-      toast({
+    if (!ref)
+      return toast({
         title: "Not signed in",
-        description: "Please log in again before using SOS.",
+        description: "Please log in again.",
         variant: "destructive",
       });
-      return;
-    }
 
     const locationResult = await captureLocation("sos");
     const updates: Record<string, any> = { sosTriggeredAt: serverTimestamp() };
-    const shouldPersistLocation = locationResult.status === "shared";
-    if (shouldPersistLocation) {
+    if (locationResult.status === "shared") {
       updates.location = locationResult.location;
       updates.locationShareReason = "sos";
       updates.locationSharedAt = serverTimestamp();
     }
-
-    let locationSaved = shouldPersistLocation;
+    let locationSaved = locationResult.status === "shared";
 
     try {
       await updateDoc(ref, updates);
     } catch (error: any) {
-      console.error("Failed to record SOS trigger", error);
       toast({
         title: "SOS alert not recorded",
-        description: error?.message ?? "We couldn't notify your contacts. Please try again.",
+        description: error?.message ?? "Try again.",
         variant: "destructive",
       });
       locationSaved = false;
@@ -893,13 +980,9 @@ export default function DashboardPage() {
       lastLocationShareRef.current = { reason: "sos", ts: Date.now() };
       setLocationShareReason("sos");
       setLocationSharedAt(new Date());
-      toast({
-        title: "Location shared",
-        description: "We sent your current location with your SOS alert.",
-      });
+      toast({ title: "Location shared", description: "Sent with your SOS alert." });
     }
 
-    // Attempt server-side call to primary EC (if phone exists)
     if (primaryEmergencyContactPhone) {
       try {
         await triggerServerTelnyxCall({
@@ -907,12 +990,9 @@ export default function DashboardPage() {
           mainUserUid: mainUserUid ?? undefined,
         });
       } catch (err: any) {
-        console.error("Server Telnyx call failed", err);
         toast({
           title: "Emergency contact call failed",
-          description:
-            err?.message ??
-            "We couldn’t start the Telnyx call to your emergency contact.",
+          description: err?.message ?? "Couldn’t start the Telnyx call.",
           variant: "destructive",
         });
       }
@@ -921,7 +1001,7 @@ export default function DashboardPage() {
         title: "Emergency contact number missing",
         description: `Add a phone number for ${
           primaryEmergencyContactName || "your emergency contact"
-        } to automatically call them during SOS alerts.`,
+        }.`,
         variant: "destructive",
       });
     }
@@ -933,48 +1013,42 @@ export default function DashboardPage() {
     primaryEmergencyContactName,
   ]);
 
-  // 68 Bind press-and-hold SOS dial behavior
+  // ---- SOS press-and-hold binding ----
   const { bind, holding, progress } = useSosDialer({
     phoneNumber: emergencyService.dial,
     contactName: `Emergency services (${emergencyService.dial})`,
     holdToActivateMs: 1500,
     confirm: true,
-    onActivate: triggerSos,
+    onActivate: () => {
+      void triggerSos();
+    },
   });
-
-  // 69 Derived flags
   const ready = (progress ?? 0) >= 0.999;
   const phoneDirty = sanitizePhone(phoneDraft) !== savedPhone;
 
-  // 70 Auto share on escalation start; clear when resolved
+  // ---- Auto share/clear on escalation begin/end ----
   useEffect(() => {
     const wasActive = prevEscalationActiveRef.current;
     const isActive = Boolean(escalationActiveAt);
-
-    if (isActive && !wasActive) {
-      void shareLocation("escalation", { silentIfDisabled: true });
-    } else if (!isActive && wasActive) {
-      clearSharedLocation().catch((error) => {
-        console.error("Failed to clear shared location after escalation resolved", error);
-      });
+    if (isActive && !wasActive) void shareLocation("escalation", { silentIfDisabled: true });
+    else if (!isActive && wasActive) {
+      clearSharedLocation().catch((e) =>
+        console.error("Failed to clear shared location after escalation", e),
+      );
     }
-
     prevEscalationActiveRef.current = isActive;
   }, [escalationActiveAt, shareLocation, clearSharedLocation]);
 
-  // 71 Manual check-in handler (also clears shared location)
+  // ---- Manual check-in ----
   const handleCheckIn = useCallback(
     async ({ showToast = true }: { showToast?: boolean } = {}) => {
       try {
         if (!userRef.current) throw new Error("Not signed in");
-
         const intervalMin =
           Number.isFinite(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 720;
-
         const dueAtMin = toEpochMinutes(Date.now()) + intervalMin;
 
-        setLastCheckIn(new Date()); // optimistic UI
-
+        setLastCheckIn(new Date()); // Optimistic
         await updateDoc(userRef.current, {
           checkinEnabled: true,
           lastCheckinAt: serverTimestamp(),
@@ -986,17 +1060,14 @@ export default function DashboardPage() {
         if (locationShareReason) {
           try {
             await clearSharedLocation();
-          } catch (error) {
-            console.error("Failed to clear shared location after check-in", error);
-          }
+          } catch {}
         }
 
-        if (showToast) {
+        if (showToast)
           toast({
             title: "Checked In!",
             description: "Your status has been updated to 'OK'.",
           });
-        }
       } catch (e: any) {
         toast({
           title: "Check-in failed",
@@ -1006,29 +1077,23 @@ export default function DashboardPage() {
         throw e;
       }
     },
-    [clearSharedLocation, intervalMinutes, locationShareReason, toast]
+    [clearSharedLocation, intervalMinutes, locationShareReason, toast],
   );
 
-  // 72 Voice quick check-in completion → run regular check-in
+  // ---- Voice check-in (modal) → after submit, also check in ----
   const handleVoiceCheckInComplete = useCallback(async () => {
     await handleCheckIn({ showToast: false });
     setVoiceMessageTarget(null);
     setQuickVoiceDialogOpen(false);
   }, [handleCheckIn]);
 
-  // 73 Pick which contact to send a voice message to
+  // ---- Choose which contact to send a quick voice to (opens the voice modal) ----
   const handleVoiceMessageContact = useCallback(
     (contact: "primary" | "secondary") => {
       const isPrimary = contact === "primary";
-      const name = isPrimary
-        ? primaryEmergencyContactName
-        : secondaryEmergencyContactName;
-      const phone = isPrimary
-        ? primaryEmergencyContactPhone
-        : secondaryEmergencyContactPhone;
-      const email = isPrimary
-        ? primaryEmergencyContactEmail
-        : secondaryEmergencyContactEmail;
+      const name = isPrimary ? primaryEmergencyContactName : secondaryEmergencyContactName;
+      const phone = isPrimary ? primaryEmergencyContactPhone : secondaryEmergencyContactPhone;
+      const email = isPrimary ? primaryEmergencyContactEmail : secondaryEmergencyContactEmail;
 
       if (!phone && !email) {
         toast({
@@ -1058,43 +1123,39 @@ export default function DashboardPage() {
     ],
   );
 
-  // 74 One-time auto check-in after auth+doc are ready (idempotent)
+  // ---- One-time auto check-in after auth+doc are ready ----
   useEffect(() => {
     if (autoCheckInTriggeredRef.current) return;
     if (!roleChecked || !mainUserUid || !userDocLoaded || !userRef.current) return;
-
     autoCheckInTriggeredRef.current = true;
     handleCheckIn({ showToast: false }).catch(() => {
       autoCheckInTriggeredRef.current = false;
     });
   }, [handleCheckIn, mainUserUid, roleChecked, userDocLoaded]);
 
-  // 75 Map interval minutes → select value
+  // ---- Map minutes → select value ----
   const selectedHours = useMemo(() => {
     const h = Math.round(intervalMinutes / 60);
-    const isValidOption = HOURS_OPTIONS.some((option) => option === h);
-    return isValidOption ? String(h) : "12";
+    const isValid = HOURS_OPTIONS.some((opt) => opt === h);
+    return isValid ? String(h) : "12";
   }, [intervalMinutes]);
 
-  // 76 Persist interval change and recompute dueAtMin
+  // ---- Persist check-in interval ----
   const handleIntervalChange = async (value: string) => {
     const hours = parseInt(value, 10);
     const minutes = hours * 60;
     try {
       setIntervalMinutes(minutes);
       if (!userRef.current) throw new Error("Not signed in");
-
       const baseMs = lastCheckIn?.getTime?.() ?? Date.now();
       const newDueAtMin = toEpochMinutes(baseMs) + minutes;
-
       await updateDoc(userRef.current, {
         checkinInterval: minutes,
         dueAtMin: newDueAtMin,
       });
-
       toast({
         title: "Check-in Interval Updated",
-        description: `Your check-in interval has been set to every ${hours} hours.`,
+        description: `Every ${hours} hours.`,
       });
     } catch (e: any) {
       toast({
@@ -1105,71 +1166,140 @@ export default function DashboardPage() {
     }
   };
 
-  // 77 Save phone number (explicit click only) with visual un-press reset
+  // ---- Save main user's phone ----
   const handlePhoneSave = useCallback(async () => {
-    if (!userRef.current) {
-      toast({
+    if (!userRef.current)
+      return toast({
         title: "Not signed in",
-        description: "Please log in again to update your phone number.",
+        description: "Please log in again.",
         variant: "destructive",
       });
-      return;
-    }
-
     const sanitized = sanitizePhone(phoneDraft);
     if (sanitized && !isValidE164Phone(sanitized)) {
-      toast({
+      return toast({
         title: "Invalid phone number",
-        description: "Use international format like +15551234567.",
+        description: "Use format like +15551234567.",
         variant: "destructive",
       });
-      return;
     }
-
     setPhoneSaving(true);
     try {
-      if (sanitized) {
-        await updateDoc(userRef.current, {
-          phone: sanitized,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        await updateDoc(userRef.current, {
-          phone: deleteField(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
+      await updateDoc(
+        userRef.current,
+        sanitized
+          ? { phone: sanitized, updatedAt: serverTimestamp() }
+          : { phone: deleteField(), updatedAt: serverTimestamp() },
+      );
       setSavedPhone(sanitized);
       setPhoneDraft(sanitized);
       toast({
         title: "Phone number updated",
         description: sanitized
-          ? "Emergency contacts will call this number from their dashboard."
-          : "Phone number removed. Add one to enable Call links.",
+          ? "Emergency contacts will call this number."
+          : "Phone number removed.",
       });
     } catch (error: any) {
-      console.error("Failed to update phone", error);
       toast({
         title: "Update failed",
         description: error?.message ?? "Please try again.",
         variant: "destructive",
       });
     } finally {
-      // Ensure button returns to its normal color after press
-      if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
+      if (
+        typeof document !== "undefined" &&
+        document.activeElement instanceof HTMLElement
+      ) {
         document.activeElement.blur();
       }
       setPhoneSaving(false);
     }
   }, [phoneDraft, toast]);
 
-  // 78 Reset phone draft
-  const handlePhoneReset = useCallback(() => {
-    setPhoneDraft(savedPhone);
-  }, [savedPhone]);
+  const handlePhoneReset = useCallback(() => setPhoneDraft(savedPhone), [savedPhone]);
 
-  // 79 Prevent flashing dashboard before role check finishes
+  // ---- NEW: Open/Close contact dialog + fetch latest voice from contact ----
+  const openContactDialog = useCallback(
+    async (kind: ContactKind) => {
+      const isPrimary = kind === "primary";
+      const name = isPrimary ? primaryEmergencyContactName : secondaryEmergencyContactName;
+      const phone = isPrimary ? primaryEmergencyContactPhone : secondaryEmergencyContactPhone;
+      const email = isPrimary ? primaryEmergencyContactEmail : secondaryEmergencyContactEmail;
+      const uid = isPrimary ? primaryEmergencyContactUid : secondaryEmergencyContactUid;
+      const normalizedUid = typeof uid === "string" ? uid.trim() : "";
+
+      setContactDialog({ open: true, kind, name, phone, email, uid: normalizedUid || null });
+
+      // Optional: best-effort fetch of the latest voice message from this contact to the main user.
+      if (!mainUserUid || !normalizedUid) {
+        setLatestVoiceFromContact(null);
+        return;
+      }
+      try {
+        const q = fsQuery(
+          collection(db, `users/${mainUserUid}/fromContactVoiceMessages`),
+          orderBy("createdAt", "desc"),
+          limit(20),
+        );
+        const snap = await getDocs(q);
+        if (snap.empty) {
+          setLatestVoiceFromContact(null);
+        } else {
+          const match = snap.docs
+            .map((doc) => doc.data() as any)
+            .find((docData) => {
+              const fromUid =
+                typeof docData?.fromEmergencyContactUid === "string"
+                  ? docData.fromEmergencyContactUid.trim()
+                  : "";
+              return fromUid && fromUid === normalizedUid;
+            });
+
+          if (!match) {
+            setLatestVoiceFromContact(null);
+            return;
+          }
+
+          setLatestVoiceFromContact({
+            audioUrl:
+              typeof match?.audioUrl === "string" && match.audioUrl.trim()
+                ? match.audioUrl
+                : typeof match?.audioDataUrl === "string"
+                ? match.audioDataUrl
+                : "",
+            createdAt: match?.createdAt?.toDate ? match.createdAt.toDate() : null,
+            transcript: typeof match?.transcript === "string" ? match.transcript : undefined,
+          });
+        }
+      } catch (e) {
+        console.warn("Latest voice fetch failed:", e);
+        setLatestVoiceFromContact(null);
+      }
+    },
+    [
+      db,
+      mainUserUid,
+      primaryEmergencyContactEmail,
+      primaryEmergencyContactName,
+      primaryEmergencyContactPhone,
+      primaryEmergencyContactUid,
+      secondaryEmergencyContactEmail,
+      secondaryEmergencyContactName,
+      secondaryEmergencyContactPhone,
+      secondaryEmergencyContactUid,
+    ],
+  );
+
+  const closeContactDialog = useCallback(() => {
+    setContactDialog((s) => ({ ...s, open: false, uid: null }));
+    setLatestVoiceFromContact(null);
+    try {
+      latestAudioRef.current?.pause();
+      if (latestAudioRef.current) latestAudioRef.current.currentTime = 0;
+    } catch {}
+    setIsPlayingLatest(false);
+  }, []);
+
+  // ---- Avoid flashing UI before role check finishes ----
   if (!roleChecked) {
     return (
       <div className="flex flex-col min-h-screen bg-secondary overflow-x-hidden">
@@ -1190,10 +1320,10 @@ export default function DashboardPage() {
     );
   }
 
-  // 80 Main UI
+  // ======================= RENDER =======================
   return (
     <>
-      {/* Voice quick message dialog (modal) */}
+      {/* Voice quick message dialog (existing feature) */}
       <Dialog
         open={quickVoiceDialogOpen}
         onOpenChange={(open) => {
@@ -1220,32 +1350,188 @@ export default function DashboardPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Contact actions dialog opened from the tiles */}
+      <Dialog
+        open={contactDialog.open}
+        onOpenChange={(open) => {
+          if (!open) closeContactDialog();
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader className="space-y-1.5">
+            <DialogTitle>Contact details</DialogTitle>
+            <DialogDescription>
+              Quick actions for {contactDialog.name || "this contact"}.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 text-left">
+            {/* Basics */}
+            <div className="rounded-md border p-3">
+              <p className="text-base font-semibold">{contactDialog.name || "—"}</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <div className="flex items-center gap-2 text-sm">
+                  <Phone className="h-4 w-4 text-muted-foreground" />
+                  <span className="truncate">{contactDialog.phone || "No phone"}</span>
+                </div>
+                <div className="flex items-center gap-2 text-sm">
+                  <Mail className="h-4 w-4 text-muted-foreground" />
+                  <span className="truncate">{contactDialog.email || "No email"}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button
+                onClick={() => handleDialEmergencyContact(contactDialog.phone)}
+                disabled={!contactDialog.phone}
+                className="w-full"
+              >
+                Call
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() =>
+                  handleVoiceMessageContact(
+                    contactDialog.kind === "primary" ? "primary" : "secondary",
+                  )
+                }
+                disabled={!contactDialog.phone && !contactDialog.email}
+                className="w-full"
+              >
+                <Mic className="mr-2 h-4 w-4" aria-hidden />
+                Voice
+              </Button>
+            </div>
+
+            {/* Latest voice from this contact (if found) */}
+            {latestVoiceFromContact ? (
+              <div className="rounded-md border p-3">
+                <p className="text-sm font-semibold">
+                  Latest message from {contactDialog.name}
+                </p>
+                {latestVoiceFromContact.transcript && (
+                  <p className="mt-1 text-sm text-muted-foreground italic">
+                    “{latestVoiceFromContact.transcript}”
+                  </p>
+                )}
+                {latestVoiceFromContact.createdAt && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Received {formatWhen(latestVoiceFromContact.createdAt)}
+                  </p>
+                )}
+                <div className="mt-3 flex items-center gap-3">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={async () => {
+                      const a = latestAudioRef.current;
+                      if (!a) return;
+                      try {
+                        if (a.paused) {
+                          await a.play();
+                          setIsPlayingLatest(true);
+                        } else {
+                          a.pause();
+                          a.currentTime = 0;
+                          setIsPlayingLatest(false);
+                        }
+                      } catch {
+                        setIsPlayingLatest(false);
+                      }
+                    }}
+                  >
+                    {isPlayingLatest ? (
+                      <>
+                        <Pause className="mr-2 h-4 w-4" /> Stop
+                      </>
+                    ) : (
+                      <>
+                        <Play className="mr-2 h-4 w-4" /> Play
+                      </>
+                    )}
+                  </Button>
+                  {/* hidden audio tag */}
+                  <audio
+                    ref={latestAudioRef}
+                    src={latestVoiceFromContact.audioUrl || undefined}
+                    preload="metadata"
+                    className="hidden"
+                    onEnded={() => setIsPlayingLatest(false)}
+                    onPause={() => setIsPlayingLatest(false)}
+                  />
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No recent voice message from this contact.
+              </p>
+            )}
+
+            {/* Shortcut to manage contact details */}
+            <div className="pt-2">
+              <Button
+                variant="ghost"
+                className="gap-2"
+                onClick={() => {
+                  router.push("/emergency-settings");
+                }}
+              >
+                <Settings className="h-4 w-4" /> Edit contact details
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex justify-end pt-1">
+            <DialogClose asChild>
+              <Button type="button" variant="outline">
+                Close
+              </Button>
+            </DialogClose>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Page chrome + content */}
       <div className="flex flex-col min-h-screen bg-secondary overflow-x-hidden">
         <Header />
-        {/* extra top padding on mobile prevents overlap with fixed header */}
         <main className="flex-grow container mx-auto px-4 pt-24 sm:pt-8 pb-8">
           <h1 className="text-3xl md:text-4xl font-headline font-bold mb-6">Your Dashboard</h1>
+          <div className="flex justify-end gap-2 mb-4">
+          {/* Scroll button for App Settings */}
+          <Button
+           size="sm"
+           variant="outline"
+           onClick={scrollToSettings}
+          >
+           Your App Settings
+          </Button>
 
-          {/* Outer grid: 1 col on mobile, 2 cols on large, 12 cols on xl for side column */}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-6">
-            {/* Primary column (cards grid). 
-                - auto-rows min height avoids overly tall mobile cards
-                - we removed aspect-square on small to fix overflow on narrow widths */}
+  {/* Navigate button for Personal Settings */}
+  <Button
+    variant="default"
+    onClick={() => router.push("/mainuser-settings")}
+  >
+    Personal Settings
+  </Button>
+
+</div>
+
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
+            {/* Primary column (main cards) */}
             <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 auto-rows-[minmax(18rem,_auto)] lg:col-span-1 xl:col-span-7">
-              {/* SOS card (unchanged position) */}
+              {/* SOS card */}
               <Card className={`${PRIMARY_CARD_BASE_CLASSES} border border-destructive bg-destructive/10 text-center`}>
                 <CardHeader className={PRIMARY_CARD_HEADER_CLASSES}>
-                  <CardTitle className={`${PRIMARY_CARD_TITLE_CLASSES} text-destructive`}>
-                    Emergency SOS
-                  </CardTitle>
+                  <CardTitle className={`${PRIMARY_CARD_TITLE_CLASSES} text-destructive`}>Emergency SOS</CardTitle>
                   <CardDescription className={`${PRIMARY_CARD_DESCRIPTION_CLASSES} font-medium text-destructive/80 break-words`}>
                     Tap only in a real emergency. We will dial {emergencyService.dial} for {emergencyService.label}.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-1 flex-col items-center justify-center gap-5">
                   <div className="flex flex-col items-center gap-3" aria-live="polite">
-                    {/* Responsive ring + button sizes to prevent overflow */}
                     <div
                       className="relative grid place-items-center h-32 w-32 md:h-40 md:w-40"
                       aria-label={
@@ -1256,26 +1542,18 @@ export default function DashboardPage() {
                           : `Hold 1.5 seconds to call ${emergencyService.dial}`
                       }
                     >
-                      {/* Ring */}
                       <div
                         className="absolute inset-0 rounded-full"
                         style={{
                           background: `conic-gradient(#ef4444 ${(progress || 0) * 360}deg, rgba(239,68,68,0.15) 0deg)`,
-                          WebkitMask:
-                            "radial-gradient(circle 48px at center, transparent 47px, black 48px)",
-                          mask:
-                            "radial-gradient(circle 48px at center, transparent 47px, black 48px)",
+                          WebkitMask: "radial-gradient(circle 48px at center, transparent 47px, black 48px)",
+                          mask: "radial-gradient(circle 48px at center, transparent 47px, black 48px)",
                           transition: "background 80ms linear",
                         }}
                       />
-                      {/* Button */}
                       <Button
                         {...bind}
-                        aria-label={
-                          ready
-                            ? `Release to call ${emergencyService.dial}`
-                            : `Hold to call ${emergencyService.dial}`
-                        }
+                        aria-label={ready ? `Release to call ${emergencyService.dial}` : `Hold to call ${emergencyService.dial}`}
                         variant="destructive"
                         size="lg"
                         className={`relative z-[1] h-24 w-24 md:h-28 md:w-28 rounded-full text-2xl shadow-lg transition-transform ${
@@ -1285,26 +1563,18 @@ export default function DashboardPage() {
                         <Siren className="h-12 w-12" />
                       </Button>
                     </div>
-
-                    {/* Helper caption */}
                     <p className="text-lg font-medium text-destructive/80 break-words text-center">
-                      {holding
-                        ? ready
-                          ? `Release to call ${emergencyService.dial}`
-                          : "Keep holding…"
-                        : `Hold 1.5s to call ${emergencyService.dial}`}
+                      {holding ? (ready ? `Release to call ${emergencyService.dial}` : "Keep holding…") : `Hold 1.5s to call ${emergencyService.dial}`}
                     </p>
                   </div>
                 </CardContent>
               </Card>
 
-              {/* Check-in card (unchanged position) */}
+              {/* Check-in card */}
               <Card className={`${PRIMARY_CARD_BASE_CLASSES} text-center`}>
                 <CardHeader className={PRIMARY_CARD_HEADER_CLASSES}>
                   <CardTitle className={PRIMARY_CARD_TITLE_CLASSES}>Check-in</CardTitle>
-                  <CardDescription className={PRIMARY_CARD_DESCRIPTION_CLASSES}>
-                    Let your contacts know you’re safe.
-                  </CardDescription>
+                  <CardDescription className={PRIMARY_CARD_DESCRIPTION_CLASSES}>Let your contacts know you’re safe.</CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-1 flex-col items-center justify-center gap-8 text-center">
                   <div className="flex flex-col items-center gap-4">
@@ -1322,74 +1592,64 @@ export default function DashboardPage() {
                 </CardContent>
               </Card>
 
-              {/* Status Overview (unchanged position) */}
+              {/* Status overview */}
               <Card className={`${PRIMARY_CARD_BASE_CLASSES} text-left`}>
-              <CardHeader className={`${PRIMARY_CARD_HEADER_CLASSES} items-center`}>
-  <Clock className="mx-auto h-10 w-10 text-muted-foreground" aria-hidden />
-  <CardTitle className={PRIMARY_CARD_TITLE_CLASSES}>Status Overview</CardTitle>
-  <CardDescription className={PRIMARY_CARD_DESCRIPTION_CLASSES}>
-    Keep tabs on your latest check-in and countdown.
-  </CardDescription>
-</CardHeader>
-
-
+                <CardHeader className={`${PRIMARY_CARD_HEADER_CLASSES} items-center`}>
+                  <Clock className="mx-auto h-10 w-10 text-muted-foreground" aria-hidden />
+                  <CardTitle className={PRIMARY_CARD_TITLE_CLASSES}>Status Overview</CardTitle>
+                  <CardDescription className={PRIMARY_CARD_DESCRIPTION_CLASSES}>
+                    Keep tabs on your latest check-in and countdown.
+                  </CardDescription>
+                </CardHeader>
                 <CardContent className="flex flex-1 flex-col justify-center">
-                                  <dl className="grid gap-4 text-base sm:grid-cols-2">
-                                                      <div className="space-y-1">
-                                                                            <dt className="text-sm text-muted-foreground">Last check-in</dt>
-                                                                                                  <dd className="text-lg font-semibold text-primary">{formatWhen(lastCheckIn)}</dd>
-                                                                                                                      </div>
-                                                                                                                                          <div className="space-y-1">
-                                                                                                                                                                <dt className="text-sm text-muted-foreground">Next scheduled check-in</dt>
-                                                                                                                                                                                      <dd className="text-lg font-semibold text-primary">{formatWhen(nextCheckIn)}</dd>
-                                                                                                                                                                                                          </div>
-                                                                                                                                                                                                                              <div className="space-y-1">
-                                                                                                                                                                                                                                                    <dt className="text-sm text-muted-foreground">Countdown</dt>
-                                                                                                                                                                                                                                                                          <dd
-                                                                                                                                                                                                                                                                                                  className={`text-lg font-semibold ${
-                                                                                                                                                                                                                                                                                                                            status === "missed" ? "text-destructive" : "text-primary"
-                                                                                                                                                                                                                                                                                                                                                    }`}
-                                                                                                                                                                                                                                                                                                                                                                          >
-                                                                                                                                                                                                                                                                                                                                                                                                  {timeLeft || "—"}
-                                                                                                                                                                                                                                                                                                                                                                                                                        </dd>
-                                                                                                                                                                                                                                                                                                                                                                                                                                            </div>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                <div className="space-y-1">
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      <dt className="text-sm text-muted-foreground">Status</dt>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            <dd
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    className={`text-lg font-semibold ${
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              status === "safe"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          ? "text-green-600"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      : status === "missed"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  ? "text-destructive"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              : "text-muted-foreground"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      }`}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            >
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    {status.toUpperCase()}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          </dd>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              </div>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  <div className="space-y-1 sm:col-span-2">
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        <dt className="text-sm text-muted-foreground">Location sharing</dt>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              <dd
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      className={`text-lg font-semibold ${
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                locationSharing === true
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ? "text-green-600"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        : locationSharing === false
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ? "text-destructive"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                : "text-muted-foreground"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        }`}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              >
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      {locationSharing === null
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ? "—"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          : locationSharing
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    ? "Enabled"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              : "Disabled"}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    </dd>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        </div>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          </dl>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          </CardContent>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        </Card>
+                  <dl className="grid gap-4 text-base sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <dt className="text-sm text-muted-foreground">Last check-in</dt>
+                      <dd className="text-lg font-semibold text-primary">{formatWhen(lastCheckIn)}</dd>
+                    </div>
+                    <div className="space-y-1">
+                      <dt className="text-sm text-muted-foreground">Next scheduled check-in</dt>
+                      <dd className="text-lg font-semibold text-primary">{formatWhen(nextCheckIn)}</dd>
+                    </div>
+                    <div className="space-y-1">
+                      <dt className="text-sm text-muted-foreground">Countdown</dt>
+                      <dd className={`text-lg font-semibold ${status === "missed" ? "text-destructive" : "text-primary"}`}>
+                        {timeLeft || "—"}
+                      </dd>
+                    </div>
+                    <div className="space-y-1">
+                      <dt className="text-sm text-muted-foreground">Status</dt>
+                      <dd
+                        className={`text-lg font-semibold ${
+                          status === "safe"
+                            ? "text-green-600"
+                            : status === "missed"
+                            ? "text-destructive"
+                            : "text-muted-foreground"
+                        }`}
+                      >
+                        {status.toUpperCase()}
+                      </dd>
+                    </div>
+                    <div className="space-y-1 sm:col-span-2">
+                      <dt className="text-sm text-muted-foreground">Location sharing</dt>
+                      <dd
+                        className={`text-lg font-semibold ${
+                          locationSharing === true
+                            ? "text-green-600"
+                            : locationSharing === false
+                            ? "text-destructive"
+                            : "text-muted-foreground"
+                        }`}
+                      >
+                        {locationSharing === null ? "—" : locationSharing ? "Enabled" : "Disabled"}
+                      </dd>
+                    </div>
+                  </dl>
+                </CardContent>
+              </Card>
 
-              {/* Voice Update card — MOVED here (into Ask AI’s old spot) */}
+              {/* Voice Update card (broadcast) */}
               <Card id="voice-update-card" className={`${PRIMARY_CARD_BASE_CLASSES} text-center`}>
                 <CardHeader className={`${PRIMARY_CARD_HEADER_CLASSES} items-center`}>
                   <Mic className="mx-auto h-10 w-10 text-muted-foreground" aria-hidden />
@@ -1404,81 +1664,70 @@ export default function DashboardPage() {
                       The quick voice message window is open. Finish or close it to use this recorder.
                     </p>
                   ) : (
+                    /**
+                     * IMPORTANT:
+                     * Voice Update card should BROADCAST to both contacts.
+                     * To ensure that, we pass targetContact={null} here.
+                     * The targeted (single-contact) send happens only from the modal opened via tiles.
+                     */
                     <VoiceCheckIn
                       onCheckIn={handleVoiceCheckInComplete}
-                      targetContact={voiceMessageTarget}
+                      targetContact={null}
                       onClearTarget={() => setVoiceMessageTarget(null)}
                     />
                   )}
                 </CardContent>
               </Card>
 
-              {/* Emergency contact quick calls (unchanged) */}
+              {/* Emergency Contacts tiles (click → pop-out dialog above) */}
               <Card className={`${PRIMARY_CARD_BASE_CLASSES} text-center`}>
                 <CardHeader className={`${PRIMARY_CARD_HEADER_CLASSES} items-center`}>
                   <PhoneCall className="mx-auto h-10 w-10 text-muted-foreground" aria-hidden />
                   <CardTitle className={PRIMARY_CARD_TITLE_CLASSES}>Emergency Contacts</CardTitle>
                   <CardDescription className={PRIMARY_CARD_DESCRIPTION_CLASSES}>
-                    Call your emergency contacts instantly when you need a quick check-in.
+                    Tap a contact to see call & voice options.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-1 flex-col gap-6">
                   <div className="grid gap-4 sm:grid-cols-2">
-                    <div className="rounded-lg border p-4">
-                      <p className="text-xl font-semibold">{primaryEmergencyContactName}</p>
-                      <p className="text-sm text-muted-foreground break-words">
-                        {primaryEmergencyContactPhone || "Add a phone number to enable calling."}
-                      </p>
-                      <div className="mt-3 flex flex-col gap-2">
-                        <Button
-                          onClick={() => handleDialEmergencyContact(primaryEmergencyContactPhone)}
-                          disabled={!primaryEmergencyContactPhone}
-                          className="w-full"
-                        >
-                          Call
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={() => handleVoiceMessageContact("primary")}
-                          disabled={!primaryEmergencyContactPhone && !primaryEmergencyContactEmail}
-                          className="w-full"
-                        >
-                          <Mic className="mr-2 h-4 w-4" aria-hidden />
-                          Voice
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="rounded-lg border p-4">
-                      <p className="text-xl font-semibold">{secondaryEmergencyContactName}</p>
-                      <p className="text-sm text-muted-foreground break-words">
-                        {secondaryEmergencyContactPhone || "Add a phone number to enable calling."}
-                      </p>
-                      <div className="mt-3 flex flex-col gap-2">
-                        <Button
-                          onClick={() => handleDialEmergencyContact(secondaryEmergencyContactPhone)}
-                          disabled={!secondaryEmergencyContactPhone}
-                          className="w-full"
-                        >
-                          Call
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          onClick={() => handleVoiceMessageContact("secondary")}
-                          disabled={!secondaryEmergencyContactPhone && !secondaryEmergencyContactEmail}
-                          className="w-full"
-                        >
-                          <Mic className="mr-2 h-4 w-4" aria-hidden />
-                          Voice
-                        </Button>
-                      </div>
-                    </div>
+                    {/* Primary tile */}
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="h-28 rounded-xl border text-left flex flex-col items-start justify-center px-4"
+                      onClick={() => openContactDialog("primary")}
+                    >
+                      <span className="text-lg font-semibold">
+                        {primaryEmergencyContactName}
+                      </span>
+                      <span className="text-sm text-muted-foreground">
+                        {primaryEmergencyContactPhone ||
+                          primaryEmergencyContactEmail ||
+                          "No details yet"}
+                      </span>
+                    </Button>
+
+                    {/* Secondary tile */}
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="h-28 rounded-xl border text-left flex flex-col items-start justify-center px-4"
+                      onClick={() => openContactDialog("secondary")}
+                    >
+                      <span className="text-lg font-semibold">
+                        {secondaryEmergencyContactName}
+                      </span>
+                      <span className="text-sm text-muted-foreground">
+                        {secondaryEmergencyContactPhone ||
+                          secondaryEmergencyContactEmail ||
+                          "No details yet"}
+                      </span>
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
 
-              {/* Ask AI card — MOVED down into Voice Update’s old spot */}
+              {/* Ask AI card */}
               <Card className={`${PRIMARY_CARD_BASE_CLASSES} border-2 border-primary/30 text-center`}>
                 <CardHeader className={PRIMARY_CARD_HEADER_CLASSES}>
                   <CardTitle className={PRIMARY_CARD_TITLE_CLASSES}>Ask AI</CardTitle>
@@ -1493,29 +1742,26 @@ export default function DashboardPage() {
             </div>
 
             {/* Secondary column with settings + EC management */}
-            <div className="space-y-6 lg:col-span-1 xl:col-span-4 xl:col-start-9">
+            <div className="space-y-6 lg:col-span-1 xl:col-span-2">
               <EmergencyContacts />
 
-              <Card className="p-4 shadow-lg">
-                <CardHeader className="pb-4">
+              <Card ref={settingsRef} className="p-4 shadow-lg">
+              <CardHeader className="pb-4">
                   <CardTitle className="text-2xl font-headline">Your Settings</CardTitle>
                   <CardDescription>
                     Manage how you stay connected with your emergency contacts.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
+                  {/* Phone settings */}
                   <section className="space-y-3">
-                    <div>
-                      <h3 className="text-lg font-semibold"></h3>
-                      <p className="text-sm text-muted-foreground"></p>
-                    </div>
                     <div className="space-y-2">
                       <Label htmlFor="main-user-phone">Your mobile phone</Label>
                       <Input
                         id="main-user-phone"
                         placeholder="+15551234567"
                         value={phoneDraft}
-                        onChange={(event) => setPhoneDraft(event.target.value)}
+                        onChange={(e) => setPhoneDraft(e.target.value)}
                         disabled={phoneSaving}
                         inputMode="tel"
                       />
@@ -1524,7 +1770,6 @@ export default function DashboardPage() {
                       </p>
                     </div>
                     <div className="flex flex-col gap-2 sm:flex-row">
-                      {/* Ensure button only acts on explicit click and returns to normal visual state */}
                       <Button
                         type="button"
                         onMouseDown={(e) => e.preventDefault()}
@@ -1534,7 +1779,6 @@ export default function DashboardPage() {
                       >
                         {phoneSaving ? "Saving…" : "Save number"}
                       </Button>
-
                       <Button
                         type="button"
                         variant="outline"
@@ -1549,6 +1793,7 @@ export default function DashboardPage() {
 
                   <Separator />
 
+                  {/* Interval settings */}
                   <section className="space-y-3">
                     <div className="flex items-center justify-between gap-4">
                       <div>
@@ -1576,6 +1821,7 @@ export default function DashboardPage() {
 
                   <Separator />
 
+                  {/* Location sharing settings */}
                   <section className="space-y-3">
                     <div>
                       <h3 className="text-lg font-semibold">Location Sharing</h3>
@@ -1602,7 +1848,8 @@ export default function DashboardPage() {
                     </div>
                     {locationShareReason ? (
                       <p className="text-sm text-muted-foreground">
-                        Last shared for {locationShareReason === "sos" ? "an SOS alert" : "an escalation"}
+                        Last shared for{" "}
+                        {locationShareReason === "sos" ? "an SOS alert" : "an escalation"}
                         {locationSharedAt ? ` (${formatWhen(locationSharedAt)})` : ""}.
                       </p>
                     ) : (
@@ -1631,8 +1878,193 @@ export default function DashboardPage() {
                       </Button>
                     )}
                     {sharingLocation && (
-                      <p className="text-xs text-muted-foreground">Sharing your current location…</p>
+                      <p className="text-xs text-muted-foreground">
+                        Sharing your current location…
+                      </p>
                     )}
+                  </section>
+                  <Separator />
+
+                  {/* Notification Settings */}
+                  <section className="space-y-4">
+                    <div>
+                      <h3 className="text-lg font-semibold">Notification Preferences</h3>
+                      <p className="text-sm text-muted-foreground">
+                        Choose how you want LifeSignal to notify you during check-ins and escalations.
+                      </p>
+                    </div>
+                  
+                    {/* Notification Method Select */}
+                    <div className="space-y-2">
+                      <Label>Notification Method</Label>
+                      <Select
+                        onValueChange={async (value) => {
+                          if (!userRef.current) return;
+                  
+                          try {
+                            await updateDoc(userRef.current, {
+                              notificationMethod: value,
+                              // Clear delay if switching to non-delay methods
+                              ...(value !== "push_then_call" && { pushThenCallDelayMinutes: deleteField() }),
+                            });
+                  
+                            toast({
+                              title: "Notification method updated",
+                              description:
+                                value === "push"
+                                  ? "You will receive push notifications only."
+                                  : value === "call_immediately"
+                                  ? "You will receive an immediate call for alerts."
+                                  : "You will get a push notification first, then a call if no response.",
+                            });
+                          } catch (error) {
+                            toast({
+                              title: "Update failed",
+                              description: "Unable to save notification preference.",
+                              variant: "destructive",
+                            });
+                          }
+                        }}
+                        value={notificationMethod || "push"}
+                      >
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder="Select notification preference" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="push">Push Only</SelectItem>
+                          <SelectItem value="push_then_call">Push → Then Call</SelectItem>
+                          <SelectItem value="call_immediately">Call Immediately</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    {/* Push Count (Only for Push Only) */}
+{notificationMethod === "push" && (
+  <div className="space-y-2">
+    <Label>Number of Push Notifications</Label>
+    <Select
+      onValueChange={async (value) => {
+        if (!userRef.current) return;
+
+        try {
+          await updateDoc(userRef.current, {
+            pushOnlyCount: Number(value),
+          });
+
+          toast({
+            title: "Push count updated",
+            description: `You will receive ${value} push notification(s).`,
+          });
+        } catch {
+          toast({
+            title: "Update failed",
+            description: "Unable to save push count.",
+            variant: "destructive",
+          });
+        }
+      }}
+      value={String(pushOnlyCount || 3)}
+    >
+      <SelectTrigger className="w-full">
+        <SelectValue placeholder="Select number of push notifications" />
+      </SelectTrigger>
+      <SelectContent>
+        {[1, 2, 3, 4, 5].map((n) => (
+          <SelectItem key={n} value={String(n)}>
+            {n} push{n > 1 ? "es" : ""}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  </div>
+)}
+
+{/* Push Count Before Call (Only for Push → Then Call) */}
+{notificationMethod === "push_then_call" && (
+  <div className="space-y-2">
+    <Label>Push Notifications Before Call</Label>
+    <Select
+      onValueChange={async (value) => {
+        if (!userRef.current) return;
+
+        try {
+          await updateDoc(userRef.current, {
+            pushThenCallCount: Number(value),
+          });
+
+          toast({
+            title: "Push-before-call count updated",
+            description: `The app will send ${value} push notification(s) before calling.`,
+          });
+        } catch {
+          toast({
+            title: "Update failed",
+            description: "Unable to save push-before-call count.",
+            variant: "destructive",
+          });
+        }
+      }}
+      value={String(pushThenCallCount || 3)}
+    >
+      <SelectTrigger className="w-full">
+        <SelectValue placeholder="Select number of push notifications before call" />
+      </SelectTrigger>
+      <SelectContent>
+        {[1, 2, 3, 4, 5].map((n) => (
+          <SelectItem key={n} value={String(n)}>
+            {n} push{n > 1 ? "es" : ""}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  </div>
+)}
+                         
+                  
+                    {/* Delay Dropdown (Only if push_then_call selected) */}
+                    {notificationMethod === "push_then_call" && (
+                      <div className="space-y-2">
+                        <Label>Delay Before Call (minutes)</Label>
+                        <Select
+                          onValueChange={async (value) => {
+                            if (!userRef.current) return;
+                  
+                            try {
+                              await updateDoc(userRef.current, {
+                                pushThenCallDelayMinutes: Number(value),
+                              });
+                  
+                              toast({
+                                title: "Delay updated",
+                                description: `We will wait ${value} minute(s) after the push notification before calling.`,
+                              });
+                            } catch {
+                              toast({
+                                title: "Update failed",
+                                description: "Unable to save delay.",
+                                variant: "destructive",
+                              });
+                            }
+                          }}
+                          value={String(pushThenCallDelayMinutes || 1)}
+                        >
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="Select delay" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {[...Array(10)].map((_, i) => (
+                              <SelectItem key={i + 1} value={String(i + 1)}>
+                                {i + 1} minute{i + 1 > 1 ? "s" : ""}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+                  
+                    {/* Info text */}
+                    <p className="text-xs text-muted-foreground">
+                      If you do not respond, LifeSignal will escalate automatically and notify your emergency contacts based on your configuration.
+                    </p>
                   </section>
                 </CardContent>
               </Card>

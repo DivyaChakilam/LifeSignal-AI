@@ -31,8 +31,16 @@ import {
   query,
   where,
   getDocs,
+  writeBatch,
 } from "firebase/firestore";
 import { Pencil, Check, X } from "lucide-react";
+
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
+} from "@/components/ui/tooltip";
 
 // -------------------- Props --------------------
 interface Props {
@@ -45,22 +53,46 @@ interface Props {
 /** Optional: configure where the policy update POST should go */
 const UPDATE_POLICY_URL = "/api/emergency_contact/update_policy";
 
-type PolicyMode = "push_then_call" | "call_immediately";
+type PolicyMode = "push_then_call" | "call_immediately" | "push_only";
 
 /* -------------------- Helpers: email & phone validation -------------------- */
 const isEmail = (v?: string) =>
   !!v && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
 /** Telnyx-friendly E.164: +, country code 1–3 digits, then national digits (total 8–15). */
-const isE164 = (v?: string) =>
-  !!v && /^\+[1-9]\d{7,14}$/.test(v.trim());
+const isE164 = (v?: string) => !!v && /^\+[1-9]\d{7,14}$/.test(v.trim());
 
 /** Keep only one leading + and digits; drop spaces, dashes, parens, etc. */
 function sanitizePhoneInput(raw: string) {
-  const trimmed = raw.trim();
+  const trimmed = (raw || "").trim();
   let s = trimmed.replace(/[^\d+]/g, "");
-  s = s[0] === "+" ? ("+" + s.slice(1).replace(/\+/g, "")) : s.replace(/\+/g, "");
+  s = s[0] === "+" ? "+" + s.slice(1).replace(/\+/g, "") : s.replace(/\+/g, "");
   return s;
+}
+
+/** Normalize an email consistently for lookups */
+function normalizeEmail(s?: string | null) {
+  return typeof s === "string" ? s.trim().toLowerCase() : "";
+}
+
+/** --------------------
+ *  Small Info tooltip helper
+ *  -------------------- */
+function Info({ text }: { text: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="Info"
+          className="ml-2 text-xs text-muted-foreground rounded-full w-5 h-5 inline-flex items-center justify-center"
+        >
+          i
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>{text}</TooltipContent>
+    </Tooltip>
+  );
 }
 
 export function EmergencyContactSettingsDialog({
@@ -83,9 +115,7 @@ export function EmergencyContactSettingsDialog({
     Partial<Record<EditableFieldKey, string>>
   >({});
 
-  // Notifications
-  const [defaultChannel, setDefaultChannel] =
-    useState<"push" | "email" | "sms">("push");
+  // Notifications (defaultChannel removed per request)
   const [quietHoursEnabled, setQuietHoursEnabled] = useState(false);
   const [quietStart, setQuietStart] = useState("22:00");
   const [quietEnd, setQuietEnd] = useState("07:00");
@@ -116,6 +146,7 @@ export function EmergencyContactSettingsDialog({
     Array<{ uid: string; name: string }>
   >([]);
   const [selectedMainUserUid, setSelectedMainUserUid] = useState("");
+  // NOTE: policyDelaySec remains seconds internally to preserve functionality
   const [policyMode, setPolicyMode] = useState<PolicyMode>("push_then_call");
   const [policyDelaySec, setPolicyDelaySec] = useState<number>(60);
   const [policySaving, setPolicySaving] = useState(false);
@@ -130,11 +161,12 @@ export function EmergencyContactSettingsDialog({
         const snap = await getDoc(userRef);
         if (snap.exists()) {
           const d = snap.data() as any;
-          setFirstName(d.firstName ?? "");
-          setLastName(d.lastName ?? "");
-          setEmail(d.email ?? "");
-          setPhone(d.phone ?? "");
-          setDefaultChannel(d.defaultChannel ?? "push");
+
+          // sanitize & normalize on load
+          setFirstName((d.firstName ?? "").trim());
+          setLastName((d.lastName ?? "").trim());
+          setEmail(normalizeEmail(d.email));
+          setPhone(sanitizePhoneInput(d.phone ?? ""));
 
           if (d.quietStart && d.quietEnd) {
             setQuietHoursEnabled(true);
@@ -183,7 +215,7 @@ export function EmergencyContactSettingsDialog({
             const uid: string =
               data.mainUserUid ||
               d.ref.parent.parent?.id ||
-              ""; // fallback to parent id
+              "";
             let name: string = data.mainUserName || "";
 
             if (!name && uid) {
@@ -228,6 +260,7 @@ export function EmergencyContactSettingsDialog({
           const d = mu.data() as any;
           const p = d.escalationPolicy || {};
           setPolicyMode((p.mode as PolicyMode) || "push_then_call");
+          // policyDelaySec is seconds in the stored policy; keep seconds internally
           setPolicyDelaySec(Number(p.callDelaySec || 60));
         }
       } catch (e) {
@@ -238,6 +271,9 @@ export function EmergencyContactSettingsDialog({
 
   // -------------------- Validation --------------------
   const validateInputs = () => {
+    const phoneSan = sanitizePhoneInput(phone);
+    const emailNorm = normalizeEmail(email);
+
     if (!firstName.trim() || !lastName.trim()) {
       toast({
         title: "Missing name",
@@ -246,7 +282,7 @@ export function EmergencyContactSettingsDialog({
       });
       return false;
     }
-    if (email && !isEmail(email)) {
+    if (emailNorm && !isEmail(emailNorm)) {
       toast({
         title: "Invalid email",
         description: "Please enter a valid email address.",
@@ -255,7 +291,7 @@ export function EmergencyContactSettingsDialog({
       return false;
     }
     // Require E.164 phone (Telnyx compatible)
-    if (!phone.trim() || !isE164(phone)) {
+    if (!phoneSan || !isE164(phoneSan)) {
       toast({
         title: "Invalid phone",
         description: "Phone must include country code, e.g. +15551234567",
@@ -269,6 +305,13 @@ export function EmergencyContactSettingsDialog({
   // -------------------- Save EC profile --------------------
   const handleSave = async () => {
     if (!emergencyContactUid) return;
+
+    // sanitize before validation + save
+    const phoneSan = sanitizePhoneInput(phone);
+    const emailNorm = normalizeEmail(email);
+    setPhone(phoneSan);
+    setEmail(emailNorm);
+
     if (!validateInputs()) return;
 
     setSaving(true);
@@ -282,9 +325,9 @@ export function EmergencyContactSettingsDialog({
         lastName: lastName.trim(),
         name: fullName,
         displayName: fullName,
-        email: email.trim(),
-        phone: phone.trim(), // already sanitized & E.164-validated
-        defaultChannel,
+        email: emailNorm,
+        phone: phoneSan, // E.164
+        // defaultChannel removed per request
         highPriorityOverride,
         escalationEnabled,
         escalationMinutes: escalationMinutes || null,
@@ -309,7 +352,8 @@ export function EmergencyContactSettingsDialog({
       const contactRef = doc(db, "users", emergencyContactUid);
       await setDoc(contactRef, data, { merge: true });
 
-      // 2) Fan-out to linked main users (server-side)
+      // 2) Server fan-out so every place is updated
+      let serverSynced = false;
       try {
         const res = await fetch("/api/emergency_contact/sync_profile", {
           method: "POST",
@@ -318,17 +362,87 @@ export function EmergencyContactSettingsDialog({
           body: JSON.stringify({
             emergencyContactUid,
             name: fullName,
-            email: email.trim(),
-            phone: phone.trim(), // E.164
+            email: emailNorm,
+            phone: phoneSan,
           }),
         });
         if (!res.ok) {
           const { error } = await res.json().catch(() => ({}));
           throw new Error(error || "Sync failed");
         }
+        serverSynced = true;
       } catch (e) {
-        // Non-fatal
-        console.error("Server sync failed:", e);
+        // Non-fatal: we also do a local best-effort fan-out below.
+        console.warn("Server sync route failed; applying local fan-out fallback.", e);
+      }
+
+      // 3) Local best-effort fan-out fallback (kept safe—no deletions)
+      if (!serverSynced) {
+        try {
+          const qLinks = query(
+            collectionGroup(db, "emergency_contact"),
+            where("emergencyContactUid", "==", emergencyContactUid)
+          );
+          const linkSnap = await getDocs(qLinks);
+
+          const batch = writeBatch(db);
+          const now = serverTimestamp();
+
+          // Update every link doc + embedded summary on the main user
+          for (const d of linkSnap.docs) {
+            const ref = d.ref; // users/{mainUserUid}/emergency_contact/{docId}
+            const parent = ref.parent.parent; // users/{mainUserUid}
+            const mainUserUid = parent?.id;
+
+            batch.set(
+              ref,
+              {
+                name: fullName,
+                email: emailNorm || null,
+                phone: phoneSan || null,
+                updatedAt: now,
+              },
+              { merge: true }
+            );
+
+            // Update the embedded summary on main user if it points to this EC by email
+            if (mainUserUid) {
+              const muRef = doc(db, "users", mainUserUid);
+              const muSnap = await getDoc(muRef);
+              const mu = muSnap.data() as any;
+
+              if (mu?.emergencyContacts) {
+                const ec = mu.emergencyContacts;
+                const updates: Record<string, any> = { updatedAt: now };
+
+                const c1Email = normalizeEmail(ec.contact1_email);
+                const c2Email = normalizeEmail(ec.contact2_email);
+
+                if (emailNorm && emailNorm === c1Email) {
+                  updates["emergencyContacts.contact1_firstName"] = firstName.trim();
+                  updates["emergencyContacts.contact1_lastName"] = lastName.trim();
+                  updates["emergencyContacts.contact1_email"] = emailNorm || null;
+                  updates["emergencyContacts.contact1_phone"] = phoneSan || null;
+                }
+                if (emailNorm && emailNorm === c2Email) {
+                  updates["emergencyContacts.contact2_firstName"] = firstName.trim();
+                  updates["emergencyContacts.contact2_lastName"] = lastName.trim();
+                  updates["emergencyContacts.contact2_email"] = emailNorm || null;
+                  updates["emergencyContacts.contact2_phone"] = phoneSan || null;
+                }
+
+                // Only write if something changed for either slot
+                if (Object.keys(updates).length > 1) {
+                  batch.set(muRef, updates, { merge: true });
+                }
+              }
+            }
+          }
+
+          await batch.commit();
+        } catch (fanErr) {
+          console.warn("Local fan-out fallback failed:", fanErr);
+        }
       }
 
       toast({ title: "Saved", description: "Settings updated and synced." });
@@ -365,6 +479,7 @@ export function EmergencyContactSettingsDialog({
           body: JSON.stringify({
             mainUserUid: selectedMainUserUid,
             mode: policyMode,
+            // API expects seconds; policyDelaySec is stored in seconds internally
             callDelaySec: policyDelaySec,
           }),
         });
@@ -455,7 +570,10 @@ export function EmergencyContactSettingsDialog({
 
   const handleConfirmEdit = (key: EditableFieldKey) => {
     const draftValue = fieldDrafts[key];
-    applyCommittedValue(key, draftValue ?? getCommittedValue(key));
+    // Phone gets sanitized on confirm to avoid invalid chars lingering in state
+    const nextVal =
+      key === "phone" ? sanitizePhoneInput(draftValue ?? getCommittedValue(key)) : (draftValue ?? getCommittedValue(key));
+    applyCommittedValue(key, nextVal);
     closeEditor(key);
   };
 
@@ -484,7 +602,23 @@ export function EmergencyContactSettingsDialog({
 
     return (
       <div className="flex flex-col space-y-1">
-        <Label>{label}</Label>
+        <div className="flex items-center">
+          <Label>{label}</Label>
+          <Info text={
+            label === "Phone"
+              ? "Phone number for \n" +
+                "receiving calls/SMS.\n" +
+                "Must be in E.164 format.\n" +
+                "Example: +15551234567"
+              : label === "Email"
+                ? "Email used for non-urgent\n" +
+                  "notifications and backups."
+                : label === "First Name" || label === "Last Name"
+                  ? "Your name as it will appear in alerts\n" +
+                    "and caller displays."
+                  : ""
+          } />
+        </div>
         <div className="flex items-center gap-2">
           {isEditing ? (
             <>
@@ -551,242 +685,280 @@ export function EmergencyContactSettingsDialog({
   // -------------------- Render --------------------
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[760px] max-h-[80vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>My Settings</DialogTitle>
-          <DialogDescription>
-            Edit your profile, notifications, and escalation preferences.
-          </DialogDescription>
-        </DialogHeader>
+      <TooltipProvider>
+        <DialogContent className="sm:max-w-[760px] max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>My Settings</DialogTitle>
+            <DialogDescription>
+              Edit your profile, notifications, and escalation preferences.
+            </DialogDescription>
+          </DialogHeader>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
-          {/* Profile */}
-          <div className="space-y-3">
-            {renderEditableField("First Name", "firstName", editField === "firstName")}
-            {renderEditableField("Last Name", "lastName", editField === "lastName")}
-            {renderEditableField("Email", "email", editField === "email")}
-            {renderEditableField("Phone", "phone", editField === "phone")}
-          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+            {/* Profile */}
+            <div className="space-y-3">
+              {renderEditableField("First Name", "firstName", editField === "firstName")}
+              {renderEditableField("Last Name", "lastName", editField === "lastName")}
+              {renderEditableField("Email", "email", editField === "email")}
+              {renderEditableField("Phone", "phone", editField === "phone")}
+            </div>
 
-          {/* Notifications & Prefs */}
-          <div className="space-y-3">
-            <Label>Default Notification Channel</Label>
-            <Select
-              value={defaultChannel}
-              onValueChange={(v) => setDefaultChannel(v as any)}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Select channel" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="push">Push</SelectItem>
-                <SelectItem value="email">Email</SelectItem>
-                <SelectItem value="sms">SMS</SelectItem>
-              </SelectContent>
-            </Select>
-
-            <div>
-              <Label>Quiet Hours</Label>
-              <div className="flex items-center gap-2 mt-1">
-                <Switch
-                  checked={quietHoursEnabled}
-                  onCheckedChange={(v) => setQuietHoursEnabled(Boolean(v))}
-                />
-                <span className="text-sm text-muted-foreground">
-                  Enable quiet hours
-                </span>
-              </div>
-              {quietHoursEnabled && (
-                <div className="flex gap-2 mt-2">
-                  <Input
-                    type="time"
-                    value={quietStart}
-                    onChange={(e) => setQuietStart(e.target.value)}
-                  />
-                  <Input
-                    type="time"
-                    value={quietEnd}
-                    onChange={(e) => setQuietEnd(e.target.value)}
-                  />
+            {/* Notifications & Prefs */}
+            <div className="space-y-3">
+              <div>
+                <div className="flex items-center">
+                  <Label>Quiet Hours</Label>
+                  <Info text="Quiet hours silence non-urgent notifications between the selected times. High-priority alerts may still break through if enabled." />
                 </div>
-              )}
-            </div>
-
-            <div className="flex items-center justify-between">
-              <Label>Always notify for SOS</Label>
-              <Switch
-                checked={highPriorityOverride}
-                onCheckedChange={(v) => setHighPriorityOverride(Boolean(v))}
-              />
-            </div>
-
-            <div>
-              <Label className="mb-1 block">Escalation (EC prefs)</Label>
-              <div className="flex items-center gap-2 mt-1">
-                <Switch
-                  checked={escalationEnabled}
-                  onCheckedChange={(v) => setEscalationEnabled(Boolean(v))}
-                />
-                <span className="text-sm text-muted-foreground">
-                  Enable automatic escalation
-                </span>
+                <div className="flex items-center gap-2 mt-1">
+                  <Switch
+                    checked={quietHoursEnabled}
+                    onCheckedChange={(v) => setQuietHoursEnabled(Boolean(v))}
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    Enable quiet hours
+                  </span>
+                </div>
+                {quietHoursEnabled && (
+                  <div className="flex gap-2 mt-2">
+                    <Input
+                      type="time"
+                      value={quietStart}
+                      onChange={(e) => setQuietStart(e.target.value)}
+                    />
+                    <Input
+                      type="time"
+                      value={quietEnd}
+                      onChange={(e) => setQuietEnd(e.target.value)}
+                    />
+                  </div>
+                )}
               </div>
-              {escalationEnabled && (
-                <>
-                  <Label className="mt-2">Escalation delay (minutes)</Label>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center">
+                  <Label>Always notify for SOS</Label>
+                  <Info text="When enabled, SOS/high-priority alerts bypass quiet hours and are always delivered." />
+                </div>
+                <Switch
+                  checked={highPriorityOverride}
+                  onCheckedChange={(v) => setHighPriorityOverride(Boolean(v))}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center">
+                  <Label className="mb-1 block">Escalation (EC prefs)</Label>
+                  <Info text="Emergency contact's personal escalation preferences. These are legacy EC-level settings and may be used by certain workflows." />
+                </div>
+                <div className="flex items-center gap-2 mt-1">
+                  <Switch
+                    checked={escalationEnabled}
+                    onCheckedChange={(v) => setEscalationEnabled(Boolean(v))}
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    Enable automatic escalation
+                  </span>
+                </div>
+                {escalationEnabled && (
+                  <>
+                    <div className="mt-2">
+                      <div className="flex items-center">
+                        <Label className="mb-1">Escalation delay (minutes)</Label>
+                        <Info text="If enabled, this determines how many minutes to wait before escalating to other contacts." />
+                      </div>
+                      <Input
+                        type="number"
+                        value={String(escalationMinutes)}
+                        onChange={(e) =>
+                          setEscalationMinutes(Number(e.target.value) || "")
+                        }
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div>
+                <div className="flex items-center">
+                  <Label>Repeat notifications</Label>
+                  <Info text="Configure how often to repeat notifications and the maximum number of repeats within the window." />
+                </div>
+                <div className="flex gap-2 items-center">
                   <Input
                     type="number"
-                    value={String(escalationMinutes)}
+                    placeholder="Every (min)"
+                    value={String(repeatEveryMinutes)}
                     onChange={(e) =>
-                      setEscalationMinutes(Number(e.target.value) || "")
+                      setRepeatEveryMinutes(Number(e.target.value) || "")
                     }
                   />
-                </>
-              )}
-            </div>
-
-            <div>
-              <Label>Repeat notifications</Label>
-              <div className="flex gap-2 items-center">
-                <Input
-                  type="number"
-                  placeholder="Every (min)"
-                  value={String(repeatEveryMinutes)}
-                  onChange={(e) =>
-                    setRepeatEveryMinutes(Number(e.target.value) || "")
-                  }
-                />
-                <Input
-                  type="number"
-                  placeholder="Max repeats"
-                  value={String(maxRepeatsPerWindow)}
-                  onChange={(e) =>
-                    setMaxRepeatsPerWindow(Number(e.target.value) || "")
-                  }
-                />
-              </div>
-            </div>
-
-            <div>
-              <Label>App preferences</Label>
-              <div className="flex items-center justify-between">
-                <span>Dark mode</span>
-                <Switch
-                  checked={darkModeEnabled}
-                  onCheckedChange={(v) => setDarkModeEnabled(Boolean(v))}
-                />
+                  <Input
+                    type="number"
+                    placeholder="Max repeats"
+                    value={String(maxRepeatsPerWindow)}
+                    onChange={(e) =>
+                      setMaxRepeatsPerWindow(Number(e.target.value) || "")
+                    }
+                  />
+                </div>
               </div>
 
-              <Label className="mt-2">Language</Label>
-              <Select value={language} onValueChange={(v) => setLanguage(v)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="en">English</SelectItem>
-                  <SelectItem value="es">Spanish</SelectItem>
-                  <SelectItem value="fr">French</SelectItem>
-                </SelectContent>
-              </Select>
+              <div>
+                <div className="flex items-center">
+                  <Label>App preferences</Label>
+                  <Info text="Personal preferences for the app experience (dark mode, language, timezone)." />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Dark mode</span>
+                  <Switch
+                    checked={darkModeEnabled}
+                    onCheckedChange={(v) => setDarkModeEnabled(Boolean(v))}
+                  />
+                </div>
 
-              <Label className="mt-2">Timezone</Label>
-              <Input
-                value={timeZone}
-                onChange={(e) => setTimeZone(e.target.value)}
-                placeholder="e.g. America/New_York"
-              />
-            </div>
-          </div>
-
-          {/* -------------------- Policy editor (per main user) -------------------- */}
-          <div className="md:col-span-2 border rounded-lg p-4 space-y-3">
-            <div className="flex flex-col md:flex-row md:items-end gap-3">
-              <div className="flex-1">
-                <Label>Manage policy for user</Label>
-                <Select
-                  value={selectedMainUserUid}
-                  onValueChange={setSelectedMainUserUid}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Select a main user" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {linkedMainUsers.length === 0 ? (
-                      <div className="px-3 py-2 text-sm text-muted-foreground">
-                        No linked main users found.
-                      </div>
-                    ) : (
-                      linkedMainUsers.map((u) => (
-                        <SelectItem key={u.uid} value={u.uid}>
-                          {u.name || u.uid}
-                        </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="flex-1">
-                <Label>Policy mode</Label>
-                <Select
-                  value={policyMode}
-                  onValueChange={(v) => setPolicyMode(v as PolicyMode)}
-                >
+                <Label className="mt-2">Language</Label>
+                <Select value={language} onValueChange={(v) => setLanguage(v)}>
                   <SelectTrigger className="w-full">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="push_then_call">
-                      Push first, then call
-                    </SelectItem>
-                    <SelectItem value="call_immediately">
-                      Call immediately
-                    </SelectItem>
+                    <SelectItem value="en">English</SelectItem>
+                    <SelectItem value="es">Spanish</SelectItem>
+                    <SelectItem value="fr">French</SelectItem>
                   </SelectContent>
                 </Select>
-              </div>
 
-              {policyDelayVisible && (
-                <div className="w-full md:w-48">
-                  <Label>Call delay (sec)</Label>
+                <div className="mt-2">
+                  <div className="flex items-center">
+                    <Label>Timezone</Label>
+                    <Info text="Set your preferred timezone for timestamps in notifications." />
+                  </div>
                   <Input
-                    type="number"
-                    value={String(policyDelaySec)}
-                    onChange={(e) =>
-                      setPolicyDelaySec(Math.max(0, Number(e.target.value) || 0))
-                    }
+                    value={timeZone}
+                    onChange={(e) => setTimeZone(e.target.value)}
+                    placeholder="e.g. America/New_York"
                   />
                 </div>
-              )}
-
-              <div className="mt-2 md:mt-0">
-                <Button onClick={handleSavePolicy} disabled={policySaving}>
-                  {policySaving ? "Saving..." : "Save Policy"}
-                </Button>
               </div>
             </div>
 
-            <p className="text-xs text-muted-foreground">
-              This policy is saved on the selected main user’s profile and is
-              used by the scheduler and call workflow. Your personal settings
-              above stay intact.
-            </p>
-          </div>
-        </div>
+            {/* -------------------- Policy editor (per main user) -------------------- */}
+            <div className="md:col-span-2 border rounded-lg p-4 space-y-3">
+              <div className="flex flex-col md:flex-row md:items-end gap-3">
+                <div className="flex-1">
+                  <div className="flex items-center">
+                    <Label>Manage policy for user</Label>
+                    <Info text="Select a main user (one who added you as an emergency contact). You will edit that user's escalation policy." />
+                  </div>
+                  <Select
+                    value={selectedMainUserUid}
+                    onValueChange={setSelectedMainUserUid}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="Select a main user" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {linkedMainUsers.length === 0 ? (
+                        <div className="px-3 py-2 text-sm text-muted-foreground">
+                          No linked main users found.
+                        </div>
+                      ) : (
+                        linkedMainUsers.map((u) => (
+                          <SelectItem key={u.uid} value={u.uid}>
+                            {u.name || u.uid}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectContent>
+                  </Select>
+                </div>
 
-        <div className="flex justify-end gap-2 mt-6">
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={saving}
-          >
-            Cancel
-          </Button>
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? "Saving..." : "Save & notify"}
-          </Button>
-        </div>
-      </DialogContent>
+                <div className="flex-1">
+                  <div className="flex items-center">
+                    <Label>Policy mode</Label>
+                    <Info text="Choose whether to push notifications first then call, call immediately, or only send push notifications." />
+                  </div>
+                  <Select
+                    value={policyMode}
+                    onValueChange={(v) => setPolicyMode(v as PolicyMode)}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="push_only">
+                        Push only (no calls)
+                      </SelectItem>
+                      <SelectItem value="push_then_call">
+                        Push first, then call
+                      </SelectItem>
+                      <SelectItem value="call_immediately">
+                        Call immediately
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {policyDelayVisible && (
+                  <div className="w-full md:w-48">
+                    <div className="flex items-center">
+                      <Label>Call delay (minutes)</Label>
+                      <Info text="How many minutes to wait after the push before placing a call. Selected value is saved in seconds behind the scenes." />
+                    </div>
+
+                    <Select
+                      value={String(Math.max(1, Math.round(policyDelaySec / 60)))}
+                      onValueChange={(v) =>
+                        setPolicyDelaySec(Math.max(1, Number(v)) * 60)
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {Array.from({ length: 60 }, (_, i) => {
+                          const m = i + 1;
+                          return (
+                            <SelectItem key={m} value={String(m)}>
+                              {m} {m === 1 ? "minute" : "minutes"}
+                            </SelectItem>
+                          );
+                        })}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+
+                <div className="mt-2 md:mt-0">
+                  <Button onClick={handleSavePolicy} disabled={policySaving}>
+                    {policySaving ? "Saving..." : "Save Policy"}
+                  </Button>
+                </div>
+              </div>
+
+              <p className="text-xs text-muted-foreground">
+                This policy is saved on the selected main user’s profile and is
+                used by the scheduler and call workflow. Your personal settings
+                above stay intact.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 mt-6">
+            <Button
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleSave} disabled={saving}>
+              {saving ? "Saving..." : "Save & notify"}
+            </Button>
+          </div>
+        </DialogContent>
+      </TooltipProvider>
     </Dialog>
   );
 }

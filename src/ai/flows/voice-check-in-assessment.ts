@@ -34,7 +34,7 @@ const prompt = ai.definePrompt({
 
 You will analyze the transcribed speech from the user's voice check-in and compare it to their previously stored voice messages.
 
-Based on the speech rate, cadence, typical phrases, and other voice characteristics, you will determine if there are any noticeable anomalies that indicate the user might not be okay.
+Based on the speech rate, cadence, and other voice characteristics, you will determine if there are any noticeable anomalies that indicate the user might not be okay.
 
 Transcribed Speech: {{{transcribedSpeech}}}
 Previous Voice Messages: {{#each previousVoiceMessages}}- {{{this}}}\n{{/each}}
