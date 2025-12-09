@@ -1,18 +1,16 @@
 // app/signup/page.tsx
-"use client"; // Marks this as a Next.js Client Component (required for hooks & browser APIs)
+"use client";
 
 import React, { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import * as z from "zod"; // Zod for schema validation
+import * as z from "zod";
 
-// Shared layout components
 import { Header } from "@/components/header";
 import { Footer } from "@/components/footer";
 
-// UI components (from your shadcn/ui library)
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -30,11 +28,11 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { useToast } from "@/hooks/use-toast"; // Custom toast hook
+import { useToast } from "@/hooks/use-toast";
 
-// Firebase imports
 import { auth, db } from "@/firebase";
 import {
   createUserWithEmailAndPassword,
@@ -43,68 +41,77 @@ import {
 } from "firebase/auth";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 
-// Helpers for roles and phone formatting
 import { normalizeRole, type Role } from "@/lib/roles";
 import { isValidE164Phone, sanitizePhone } from "@/lib/phone";
 
-/* -------------------------------------------------------------------------- */
-/*                                PASSWORD RULES                              */
-/* -------------------------------------------------------------------------- */
-// Define password strength & composition policy
+/* ----------------------------------------------- */
+/* PASSWORD RULES                                  */
+/* ----------------------------------------------- */
 const passwordValidation = z
   .string()
-  .min(8, { message: "Password must be at least 8 characters long." })
-  .regex(/[a-z]/, { message: "Password must contain at least one lowercase letter." })
-  .regex(/[A-Z]/, { message: "Password must contain at least one uppercase letter." })
-  .regex(/[0-9]/, { message: "Password must contain at least one number." })
-  .regex(/[^a-zA-Z0-9]/, { message: "Password must contain at least one special character." });
+  .min(8, { message: "Password must be at least 8 characters." })
+  .regex(/[a-z]/, { message: "Must contain a lowercase letter." })
+  .regex(/[A-Z]/, { message: "Must contain an uppercase letter." })
+  .regex(/[0-9]/, { message: "Must contain a number." })
+  .regex(/[^a-zA-Z0-9]/, { message: "Must contain a special character." });
 
-/* -------------------------------------------------------------------------- */
-/*                                SIGNUP SCHEMA                               */
-/* -------------------------------------------------------------------------- */
-// Defines and validates all signup fields using Zod
+/* ----------------------------------------------- */
+/* SIGNUP SCHEMA (UPDATED WITH CONSENTS)           */
+/* ----------------------------------------------- */
 const signupSchema = z
   .object({
     firstName: z.string().min(2, { message: "First name must be at least 2 characters." }),
     lastName: z.string().min(2, { message: "Last name must be at least 2 characters." }),
     email: z.string().email({ message: "Please enter a valid email." }),
-    // Preprocess phone number to sanitize before validating (must include +country code)
+
     phone: z.preprocess(
       (v) => (typeof v === "string" ? sanitizePhone(v) : v),
       z
         .string()
         .min(1, { message: "Phone number is required." })
         .refine((value) => isValidE164Phone(value), {
-          message: "Enter a valid phone number including country code, e.g. +15551234567.",
+          message: "Enter a valid phone number including country code.",
         })
     ),
-    password: passwordValidation, // Apply password policy
-    confirmPassword: z.string(), // For password confirmation
+
+    password: passwordValidation,
+    confirmPassword: z.string(),
+
+    // NEW CONSENT FIELDS:
+    acceptTerms: z.boolean().refine((val) => val === true, {
+      message: "You must accept the Terms & Conditions.",
+    }),
+    acceptPrivacy: z.boolean().refine((val) => val === true, {
+      message: "You must accept the Privacy Policy.",
+    }),
+
+    // Optional:
+    acceptMarketing: z.boolean().optional(),
   })
-  // Cross-field validation: password === confirmPassword
   .refine((data) => data.password === data.confirmPassword, {
     message: "Passwords do not match.",
     path: ["confirmPassword"],
   });
 
-/* -------------------------------------------------------------------------- */
-/*                              HELPER FUNCTIONS                              */
-/* -------------------------------------------------------------------------- */
-// Fire-and-forget session cookie so API calls can use auth without reload
+/* ----------------------------------------------- */
+/* HELPER FUNCTIONS                                */
+/* ----------------------------------------------- */
+
+// Save Firebase session cookie (non-blocking)
 async function setSessionCookieFast() {
   const u = auth.currentUser;
   if (!u) return;
-  const idToken = await u.getIdToken(true); // Refresh token
+  const idToken = await u.getIdToken(true);
   fetch("/api/auth/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
     body: JSON.stringify({ idToken }),
-    keepalive: true, // Keeps running even if user leaves the page
+    keepalive: true,
   }).catch(() => {});
 }
 
-// If sign-up was triggered by an invite token, auto-accept in the background
+// Accept emergency contact invitation if signup was triggered via invite link
 async function maybeAutoAcceptInvite(token: string | null) {
   if (!token) return;
   fetch("/api/emergency_contact/accept", {
@@ -116,10 +123,10 @@ async function maybeAutoAcceptInvite(token: string | null) {
   }).catch(() => {});
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                 COMPONENTS                                 */
-/* -------------------------------------------------------------------------- */
-// Wrapper with suspense to handle Next.js searchParams streaming
+/* ----------------------------------------------- */
+/* MAIN COMPONENT + SUSPENSE WRAPPER               */
+/* ----------------------------------------------- */
+
 export default function SignupPage() {
   return (
     <Suspense fallback={<div className="p-6 text-sm text-muted-foreground">Loading…</div>}>
@@ -128,30 +135,25 @@ export default function SignupPage() {
   );
 }
 
-// Main Signup Component
 function SignupPageContent() {
-  const router = useRouter(); // Next.js navigation
-  const params = useSearchParams(); // URL params
-  const { toast } = useToast(); // Toast handler
+  const router = useRouter();
+  const params = useSearchParams();
+  const { toast } = useToast();
 
-  // Extract & normalize role from query (default to "main_user")
   const role: Role = normalizeRole(params.get("role")) ?? "main_user";
-  const token = params.get("token") || null; // Optional invite token
-
-  // "next" param (used for redirect after login)
+  const token = params.get("token") || null;
   const rawNext = params.get("next");
+
   const next = useMemo(() => {
     const n = rawNext && rawNext.startsWith("/") ? rawNext : "";
-    return n === "/" ? "" : n; // Clean "/" → ""
+    return n === "/" ? "" : n;
   }, [rawNext]);
 
-  // Get origin for building verify URL
   const origin =
     typeof window !== "undefined"
       ? window.location.origin
       : process.env.NEXT_PUBLIC_APP_ORIGIN || "";
 
-  // Build continueUrl for Firebase email verification link
   const continueUrl = useMemo(() => {
     const q = new URLSearchParams({
       role,
@@ -162,11 +164,9 @@ function SignupPageContent() {
     return `${origin}/verify-email?${q}`;
   }, [origin, role, next, token]);
 
-  // Local state for password meter & loading spinner
   const [passwordStrength, setPasswordStrength] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // React Hook Form setup with Zod validation
   const form = useForm<z.infer<typeof signupSchema>>({
     resolver: zodResolver(signupSchema),
     defaultValues: {
@@ -176,10 +176,12 @@ function SignupPageContent() {
       phone: "",
       password: "",
       confirmPassword: "",
+      acceptTerms: false,
+      acceptPrivacy: false,
+      acceptMarketing: false,
     },
   });
 
-  // Password strength calculator (0–100%)
   const calculatePasswordStrength = (password: string) => {
     let score = 0;
     if (password.length >= 8) score++;
@@ -190,33 +192,33 @@ function SignupPageContent() {
     return (score / 5) * 100;
   };
 
-  // Update strength meter live
   const watchedPassword = form.watch("password");
-  useEffect(() => setPasswordStrength(calculatePasswordStrength(watchedPassword)), [watchedPassword]);
+  useEffect(() => {
+    setPasswordStrength(calculatePasswordStrength(watchedPassword));
+  }, [watchedPassword]);
 
-  /* ---------------------------------------------------------------------- */
-  /*                               SUBMIT LOGIC                             */
-  /* ---------------------------------------------------------------------- */
+  /* ----------------------------------------------- */
+  /* SUBMIT HANDLER (UPDATED WITH CONSENT LOGGING)   */
+  /* ----------------------------------------------- */
+
   const onSubmit = async (values: z.infer<typeof signupSchema>) => {
     try {
       setIsSubmitting(true);
 
-      const sanitizedPhone = sanitizePhone(values.phone); // Normalize phone
+      const sanitizedPhone = sanitizePhone(values.phone);
 
-      // 1️⃣ Create Firebase Auth user
+      // 1️⃣ Create Firebase Auth User
       const cred = await createUserWithEmailAndPassword(
         auth,
         values.email.trim().toLowerCase(),
         values.password
       );
 
-      // 2️⃣ Update displayName ("First Last")
-      const displayName = [values.firstName.trim(), values.lastName.trim()]
-        .filter(Boolean)
-        .join(" ");
+      // 2️⃣ Update display name
+      const displayName = `${values.firstName.trim()} ${values.lastName.trim()}`.trim();
       await updateProfile(cred.user, { displayName });
 
-      // 3️⃣ Save profile to Firestore
+      // 3️⃣ Save Firestore user profile + consents
       await setDoc(
         doc(db, "users", cred.user.uid),
         {
@@ -228,40 +230,42 @@ function SignupPageContent() {
           phone: sanitizedPhone,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
+      
+          // NEW CONSENT FIELDS SAVED TO FIRESTORE
+          acceptTerms: values.acceptTerms,
+          acceptPrivacy: values.acceptPrivacy,
+          acceptMarketing: values.acceptMarketing ?? false,
         },
         { merge: true }
-      );
+      );      
 
-      // 4️⃣ Send verification email (Firebase-hosted link)
+      // 4️⃣ Send email verification
       try {
         await sendEmailVerification(cred.user, {
           url: continueUrl,
           handleCodeInApp: true,
         });
-      } catch (e) {
-        console.warn("sendEmailVerification failed:", e);
+      } catch (err) {
+        console.warn("sendEmailVerification failed:", err);
       }
 
-      // 5️⃣ Background: set cookie, handle invite (non-blocking)
-      void (async () => {
-        try {
-          await setSessionCookieFast();
-        } catch {}
-        await maybeAutoAcceptInvite(token);
-      })();
+      // 5️⃣ Background actions
+      void setSessionCookieFast();
+      void maybeAutoAcceptInvite(token);
 
-      // 6️⃣ Redirect to verify-email page
+      // 6️⃣ Redirect
       router.push(
-        `/verify-email?email=${encodeURIComponent(values.email)}&role=${encodeURIComponent(role)}${
-          next ? `&next=${encodeURIComponent(next)}` : ""
-        }${token ? `&token=${encodeURIComponent(token)}` : ""}`
+        `/verify-email?email=${encodeURIComponent(values.email)}&role=${encodeURIComponent(
+          role
+        )}${next ? `&next=${encodeURIComponent(next)}` : ""}${
+          token ? `&token=${encodeURIComponent(token)}` : ""
+        }`
       );
     } catch (err: any) {
-      // Handle Firebase errors cleanly
       console.error(err);
-      const code = err?.code as string | undefined;
+
       let message = "Something went wrong. Please try again.";
-      switch (code) {
+      switch (err?.code) {
         case "auth/email-already-in-use":
           message = "That email is already registered.";
           break;
@@ -271,28 +275,26 @@ function SignupPageContent() {
         case "auth/weak-password":
           message = "Password is too weak.";
           break;
-        case "auth/operation-not-allowed":
-          message = "Email/password sign up is disabled.";
-          break;
         case "auth/too-many-requests":
-          message = "Too many attempts. Please try again later.";
+          message = "Too many attempts. Try later.";
           break;
       }
-      toast({ title: "Signup failed", description: message, variant: "destructive" });
+
+      toast({
+        title: "Signup failed",
+        description: message,
+        variant: "destructive",
+      });
     } finally {
       setIsSubmitting(false);
     }
   };
-
-  /* ---------------------------------------------------------------------- */
-  /*                                 RENDER                                 */
-  /* ---------------------------------------------------------------------- */
   return (
     <div className="flex flex-col min-h-screen bg-background">
-      <Header /> {/* Shared header component */}
+      <Header />
+  
       <main className="flex-grow flex items-center justify-center p-4">
         <Card className="w-full max-w-lg shadow-xl">
-          {/* ---- Card Header ---- */}
           <CardHeader className="text-center">
             <CardTitle className="text-3xl font-headline">Create Your Account</CardTitle>
             <CardDescription>
@@ -301,8 +303,8 @@ function SignupPageContent() {
                 : "Create your main user account."}
             </CardDescription>
           </CardHeader>
-
-          {/* ---- Form ---- */}
+  
+          {/* ---------- FORM ---------- */}
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)}>
               <CardContent className="space-y-4">
@@ -314,18 +316,13 @@ function SignupPageContent() {
                     <FormItem>
                       <FormLabel>First Name</FormLabel>
                       <FormControl>
-                        <Input
-                          placeholder="John"
-                          {...field}
-                          disabled={isSubmitting}
-                          autoComplete="given-name"
-                        />
+                        <Input placeholder="John" {...field} disabled={isSubmitting} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-
+  
                 {/* Last Name */}
                 <FormField
                   control={form.control}
@@ -334,40 +331,34 @@ function SignupPageContent() {
                     <FormItem>
                       <FormLabel>Last Name</FormLabel>
                       <FormControl>
-                        <Input
-                          placeholder="Doe"
-                          {...field}
-                          disabled={isSubmitting}
-                          autoComplete="family-name"
-                        />
+                        <Input placeholder="Doe" {...field} disabled={isSubmitting} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-
+  
                 {/* Email */}
                 <FormField
                   control={form.control}
                   name="email"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Email Address</FormLabel>
+                      <FormLabel>Email</FormLabel>
                       <FormControl>
                         <Input
                           type="email"
                           placeholder="you@example.com"
                           {...field}
                           disabled={isSubmitting}
-                          autoComplete="email"
                         />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-
-                {/* Phone (must include country code) */}
+  
+                {/* Phone */}
                 <FormField
                   control={form.control}
                   name="phone"
@@ -379,17 +370,16 @@ function SignupPageContent() {
                           placeholder="+15551234567"
                           {...field}
                           disabled={isSubmitting}
-                          autoComplete="tel"
                         />
                       </FormControl>
                       <p className="text-xs text-muted-foreground">
-                        Must include your country code (e.g. +1). Used for emergency calls.
+                        Must include country code. Used for emergency voice calls.
                       </p>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-
+  
                 {/* Password */}
                 <FormField
                   control={form.control}
@@ -403,16 +393,18 @@ function SignupPageContent() {
                           placeholder="••••••••"
                           {...field}
                           disabled={isSubmitting}
-                          autoComplete="new-password"
                         />
                       </FormControl>
+  
                       {/* Strength meter */}
-                      {field.value && <Progress value={passwordStrength} className="mt-2 h-2" />}
+                      {field.value && (
+                        <Progress value={passwordStrength} className="mt-2 h-2" />
+                      )}
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-
+  
                 {/* Confirm Password */}
                 <FormField
                   control={form.control}
@@ -426,23 +418,100 @@ function SignupPageContent() {
                           placeholder="••••••••"
                           {...field}
                           disabled={isSubmitting}
-                          autoComplete="new-password"
                         />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
                   )}
                 />
-              </CardContent>
+  
+                {/* ---------------------------- */}
+                {/* REQUIRED CONSENTS            */}
+                {/* ---------------------------- */}
+  
+                {/* Terms & Conditions */}
+                <FormField
+                  control={form.control}
+                  name="acceptTerms"
+                  render={({ field }) => (
+                    <FormItem className="flex items-start gap-3">
+                      <FormControl>
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 mt-1"
+                          checked={field.value}
+                          onChange={field.onChange}
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <FormLabel className="text-sm cursor-pointer">
+                        I agree to the{" "}
+                        <Link href="/terms" className="text-primary underline">
+                          Terms & Conditions
+                        </Link>
+                      </FormLabel>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+  
+                {/* Privacy Policy */}
+                <FormField
+                  control={form.control}
+                  name="acceptPrivacy"
+                  render={({ field }) => (
+                    <FormItem className="flex items-start gap-3">
+                      <FormControl>
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 mt-1"
+                          checked={field.value}
+                          onChange={field.onChange}
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <FormLabel className="text-sm cursor-pointer">
+                        I have read and accept the{" "}
+                        <Link href="/privacy" className="text-primary underline">
+                          Privacy Policy
+                        </Link>
+                      </FormLabel>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+  
+                {/* ---------------------------- */}
+                {/* OPTIONAL CONSENT             */}
+                {/* ---------------------------- */}
+  
+                <FormField
+                  control={form.control}
+                  name="acceptMarketing"
+                  render={({ field }) => (
+                    <FormItem className="flex items-start gap-3 space-y-0">
+                     <FormControl>
+                      <input
+                        type="checkbox"
+                        checked={field.value}
+                        onChange={(e) => field.onChange(e.target.checked)}
+                        className="mt-1"
+                      />
+                     </FormControl>
+                    <FormLabel>Send me helpful tips & product updates (optional)</FormLabel>
+                   <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-              {/* ---- Footer ---- */}
+              </CardContent>
+  
+              {/* ---------- FOOTER ---------- */}
               <CardFooter className="flex-col gap-4">
-                {/* Submit button */}
                 <Button type="submit" className="w-full text-lg py-6" disabled={isSubmitting}>
                   {isSubmitting ? "Creating…" : "Create Account"}
                 </Button>
-
-                {/* Login link */}
+  
                 <p className="text-center text-sm text-muted-foreground">
                   Already have an account?{" "}
                   <Link
@@ -459,7 +528,8 @@ function SignupPageContent() {
           </Form>
         </Card>
       </main>
-      <Footer /> {/* Shared footer component */}
+  
+      <Footer />
     </div>
   );
 }
