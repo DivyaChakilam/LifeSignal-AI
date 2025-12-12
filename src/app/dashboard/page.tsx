@@ -1506,7 +1506,7 @@ const scrollToSettings = () => {
            variant="outline"
            onClick={scrollToSettings}
           >
-           Your App Settings
+           Notification Settings
           </Button>
 
   {/* Navigate button for Personal Settings */}
@@ -1747,7 +1747,7 @@ const scrollToSettings = () => {
 
               <Card ref={settingsRef} className="p-4 shadow-lg">
               <CardHeader className="pb-4">
-                  <CardTitle className="text-2xl font-headline">Your Settings</CardTitle>
+                  <CardTitle className="text-2xl font-headline">Notification Settings</CardTitle>
                   <CardDescription>
                     Manage how you stay connected with your emergency contacts.
                   </CardDescription>
